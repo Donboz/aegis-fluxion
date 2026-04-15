@@ -18,6 +18,8 @@ import type {
 const DEFAULT_CLOSE_CODE = 1000;
 const DEFAULT_CLOSE_REASON = "";
 const INTERNAL_HANDSHAKE_EVENT = "__handshake";
+const INTERNAL_RPC_REQUEST_EVENT = "__rpc:req";
+const INTERNAL_RPC_RESPONSE_EVENT = "__rpc:res";
 const READY_EVENT = "ready";
 const HANDSHAKE_CURVE = "prime256v1";
 const ENCRYPTION_ALGORITHM = "aes-256-gcm";
@@ -32,6 +34,7 @@ const DEFAULT_RECONNECT_INITIAL_DELAY_MS = 250;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 10_000;
 const DEFAULT_RECONNECT_FACTOR = 2;
 const DEFAULT_RECONNECT_JITTER_RATIO = 0.2;
+const DEFAULT_RPC_TIMEOUT_MS = 5_000;
 
 interface HandshakePayload {
   publicKey: string;
@@ -57,10 +60,38 @@ interface EncryptedPacketParts {
   ciphertext: Buffer;
 }
 
+interface RpcRequestPayload {
+  id: string;
+  event: string;
+  data: unknown;
+}
+
+interface RpcResponsePayload {
+  id: string;
+  ok: boolean;
+  data?: unknown;
+  error?: string;
+}
+
+interface PendingRpcRequest {
+  resolve: (value: unknown) => void;
+  reject: (reason?: unknown) => void;
+  timeoutHandle: ReturnType<typeof setTimeout>;
+}
+
 export interface SecureEnvelope<TData = unknown> {
   event: string;
   data: TData;
 }
+
+export interface SecureAckOptions {
+  timeoutMs?: number;
+}
+
+export type SecureAckCallback = (
+  error: Error | null,
+  response?: unknown
+) => void;
 
 export interface SecureServerHeartbeatOptions {
   enabled?: boolean;
@@ -92,6 +123,12 @@ export interface SecureServerClient {
   id: string;
   socket: WebSocket;
   request: IncomingMessage;
+  emit: (
+    event: string,
+    data: unknown,
+    callbackOrOptions?: SecureAckCallback | SecureAckOptions,
+    maybeCallback?: SecureAckCallback
+  ) => boolean | Promise<unknown>;
   join: (room: string) => boolean;
   leave: (room: string) => boolean;
   leaveAll: () => number;
@@ -106,7 +143,7 @@ export type SecureErrorHandler = (error: Error) => void;
 export type SecureServerEventHandler = (
   data: unknown,
   client: SecureServerClient
-) => void;
+) => unknown | Promise<unknown>;
 
 export type SecureServerConnectionHandler = (
   client: SecureServerClient
@@ -120,7 +157,7 @@ export type SecureServerDisconnectHandler = (
 
 export type SecureServerReadyHandler = (client: SecureServerClient) => void;
 
-export type SecureClientEventHandler = (data: unknown) => void;
+export type SecureClientEventHandler = (data: unknown) => unknown | Promise<unknown>;
 
 export type SecureClientConnectHandler = () => void;
 
@@ -246,7 +283,124 @@ function decodeCloseReason(reason: Buffer): string {
 }
 
 function isReservedEmitEvent(event: string): boolean {
-  return event === INTERNAL_HANDSHAKE_EVENT || event === READY_EVENT;
+  return (
+    event === INTERNAL_HANDSHAKE_EVENT ||
+    event === INTERNAL_RPC_REQUEST_EVENT ||
+    event === INTERNAL_RPC_RESPONSE_EVENT ||
+    event === READY_EVENT
+  );
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return typeof value === "object" && value !== null && "then" in value;
+}
+
+function normalizeRpcTimeout(timeoutMs: number | undefined): number {
+  const resolvedTimeoutMs = timeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
+
+  if (!Number.isFinite(resolvedTimeoutMs) || resolvedTimeoutMs <= 0) {
+    throw new Error("ACK timeoutMs must be a positive number.");
+  }
+
+  return resolvedTimeoutMs;
+}
+
+function parseRpcRequestPayload(data: unknown): RpcRequestPayload {
+  if (typeof data !== "object" || data === null) {
+    throw new Error("Invalid RPC request payload format.");
+  }
+
+  const payload = data as Partial<RpcRequestPayload>;
+
+  if (typeof payload.id !== "string" || payload.id.trim().length === 0) {
+    throw new Error("RPC request payload must include a non-empty id.");
+  }
+
+  if (typeof payload.event !== "string" || payload.event.trim().length === 0) {
+    throw new Error("RPC request payload must include a non-empty event.");
+  }
+
+  return {
+    id: payload.id,
+    event: payload.event,
+    data: payload.data
+  };
+}
+
+function parseRpcResponsePayload(data: unknown): RpcResponsePayload {
+  if (typeof data !== "object" || data === null) {
+    throw new Error("Invalid RPC response payload format.");
+  }
+
+  const payload = data as Partial<RpcResponsePayload>;
+
+  if (typeof payload.id !== "string" || payload.id.trim().length === 0) {
+    throw new Error("RPC response payload must include a non-empty id.");
+  }
+
+  if (typeof payload.ok !== "boolean") {
+    throw new Error("RPC response payload must include a boolean ok field.");
+  }
+
+  if (payload.error !== undefined && typeof payload.error !== "string") {
+    throw new Error("RPC response payload error must be a string when provided.");
+  }
+
+  const parsedPayload: RpcResponsePayload = {
+    id: payload.id,
+    ok: payload.ok,
+    data: payload.data
+  };
+
+  if (payload.error !== undefined) {
+    parsedPayload.error = payload.error;
+  }
+
+  return parsedPayload;
+}
+
+function resolveAckArguments(
+  callbackOrOptions?: SecureAckCallback | SecureAckOptions,
+  maybeCallback?: SecureAckCallback
+): {
+  expectsAck: boolean;
+  callback?: SecureAckCallback;
+  timeoutMs: number;
+} {
+  if (callbackOrOptions === undefined && maybeCallback === undefined) {
+    return {
+      expectsAck: false,
+      timeoutMs: DEFAULT_RPC_TIMEOUT_MS
+    };
+  }
+
+  if (typeof callbackOrOptions === "function") {
+    if (maybeCallback !== undefined) {
+      throw new Error("ACK callback was provided more than once.");
+    }
+
+    return {
+      expectsAck: true,
+      callback: callbackOrOptions,
+      timeoutMs: DEFAULT_RPC_TIMEOUT_MS
+    };
+  }
+
+  const options = callbackOrOptions;
+
+  if (options !== undefined && (typeof options !== "object" || options === null)) {
+    throw new Error("ACK options must be an object.");
+  }
+
+  if (maybeCallback !== undefined && typeof maybeCallback !== "function") {
+    throw new Error("ACK callback must be a function.");
+  }
+
+  return {
+    ...(maybeCallback ? { callback: maybeCallback } : {}),
+    expectsAck: true,
+    timeoutMs: normalizeRpcTimeout(options?.timeoutMs)
+  };
 }
 
 function createEphemeralHandshakeState(): { ecdh: ECDH; localPublicKey: string } {
@@ -381,6 +535,11 @@ export class SecureServer {
   private readonly encryptionKeyBySocket = new WeakMap<WebSocket, Buffer>();
 
   private readonly pendingPayloadsBySocket = new WeakMap<WebSocket, SecureEnvelope[]>();
+
+  private readonly pendingRpcRequestsBySocket = new WeakMap<
+    WebSocket,
+    Map<string, PendingRpcRequest>
+  >();
 
   private readonly heartbeatStateBySocket = new WeakMap<
     WebSocket,
@@ -521,7 +680,35 @@ export class SecureServer {
     return this;
   }
 
-  public emitTo(clientId: string, event: string, data: unknown): boolean {
+  public emitTo(clientId: string, event: string, data: unknown): boolean;
+  public emitTo(
+    clientId: string,
+    event: string,
+    data: unknown,
+    callback: SecureAckCallback
+  ): boolean;
+  public emitTo(
+    clientId: string,
+    event: string,
+    data: unknown,
+    options: SecureAckOptions
+  ): Promise<unknown>;
+  public emitTo(
+    clientId: string,
+    event: string,
+    data: unknown,
+    options: SecureAckOptions,
+    callback: SecureAckCallback
+  ): boolean;
+  public emitTo(
+    clientId: string,
+    event: string,
+    data: unknown,
+    callbackOrOptions?: SecureAckCallback | SecureAckOptions,
+    maybeCallback?: SecureAckCallback
+  ): boolean | Promise<unknown> {
+    const ackArgs = resolveAckArguments(callbackOrOptions, maybeCallback);
+
     try {
       if (isReservedEmitEvent(event)) {
         throw new Error(`The event "${event}" is reserved and cannot be emitted manually.`);
@@ -533,10 +720,46 @@ export class SecureServer {
         throw new Error(`Client with id ${clientId} was not found.`);
       }
 
-      this.sendOrQueuePayload(client.socket, { event, data });
-      return true;
+      if (!ackArgs.expectsAck) {
+        this.sendOrQueuePayload(client.socket, { event, data });
+        return true;
+      }
+
+      const ackPromise = this.sendRpcRequest(
+        client.socket,
+        event,
+        data,
+        ackArgs.timeoutMs
+      );
+
+      if (ackArgs.callback) {
+        ackPromise
+          .then((response) => {
+            ackArgs.callback?.(null, response);
+          })
+          .catch((error) => {
+            ackArgs.callback?.(
+              normalizeToError(error, `ACK callback failed for client ${client.id}.`)
+            );
+          });
+
+        return true;
+      }
+
+      return ackPromise;
     } catch (error) {
-      this.notifyError(normalizeToError(error, "Failed to emit event to client."));
+      const normalizedError = normalizeToError(error, "Failed to emit event to client.");
+      this.notifyError(normalizedError);
+
+      if (ackArgs.callback) {
+        ackArgs.callback(normalizedError);
+        return false;
+      }
+
+      if (ackArgs.expectsAck) {
+        return Promise.reject(normalizedError);
+      }
+
       return false;
     }
   }
@@ -567,6 +790,11 @@ export class SecureServer {
       this.stopHeartbeatLoop();
 
       for (const client of this.clientsById.values()) {
+        this.rejectPendingRpcRequests(
+          client.socket,
+          new Error("Server closed before ACK response was received.")
+        );
+
         if (
           client.socket.readyState === WebSocket.OPEN ||
           client.socket.readyState === WebSocket.CONNECTING
@@ -642,9 +870,14 @@ export class SecureServer {
         heartbeatState.awaitingPong &&
         now - heartbeatState.lastPingAt >= this.heartbeatConfig.timeoutMs
       ) {
+        this.rejectPendingRpcRequests(
+          socket,
+          new Error(`Heartbeat timeout while waiting for client ${client.id} ACK response.`)
+        );
         this.sharedSecretBySocket.delete(socket);
         this.encryptionKeyBySocket.delete(socket);
         this.pendingPayloadsBySocket.delete(socket);
+        this.pendingRpcRequestsBySocket.delete(socket);
         this.handshakeStateBySocket.delete(socket);
         this.heartbeatStateBySocket.delete(socket);
         socket.terminate();
@@ -701,6 +934,7 @@ export class SecureServer {
       this.clientIdBySocket.set(socket, clientId);
       this.handshakeStateBySocket.set(socket, handshakeState);
       this.pendingPayloadsBySocket.set(socket, []);
+      this.pendingRpcRequestsBySocket.set(socket, new Map<string, PendingRpcRequest>());
       this.heartbeatStateBySocket.set(socket, {
         awaitingPong: false,
         lastPingAt: 0
@@ -783,6 +1017,17 @@ export class SecureServer {
       }
 
       const decryptedEnvelope = parseEnvelopeFromText(decryptedPayload);
+
+      if (decryptedEnvelope.event === INTERNAL_RPC_RESPONSE_EVENT) {
+        this.handleRpcResponse(client.socket, decryptedEnvelope.data);
+        return;
+      }
+
+      if (decryptedEnvelope.event === INTERNAL_RPC_REQUEST_EVENT) {
+        void this.handleRpcRequest(client, decryptedEnvelope.data);
+        return;
+      }
+
       this.dispatchCustomEvent(decryptedEnvelope.event, decryptedEnvelope.data, client);
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to process incoming server message."));
@@ -798,6 +1043,11 @@ export class SecureServer {
       this.sharedSecretBySocket.delete(client.socket);
       this.encryptionKeyBySocket.delete(client.socket);
       this.pendingPayloadsBySocket.delete(client.socket);
+      this.rejectPendingRpcRequests(
+        client.socket,
+        new Error(`Client ${client.id} disconnected before ACK response was received.`)
+      );
+      this.pendingRpcRequestsBySocket.delete(client.socket);
       this.heartbeatStateBySocket.delete(client.socket);
 
       const decodedReason = decodeCloseReason(reason);
@@ -832,7 +1082,18 @@ export class SecureServer {
 
     for (const handler of handlers) {
       try {
-        handler(data, client);
+        const handlerResult = handler(data, client);
+
+        if (isPromiseLike(handlerResult)) {
+          void Promise.resolve(handlerResult).catch((error) => {
+            this.notifyError(
+              normalizeToError(
+                error,
+                `Server event handler failed for event ${event}.`
+              )
+            );
+          });
+        }
       } catch (error) {
         this.notifyError(
           normalizeToError(
@@ -877,6 +1138,149 @@ export class SecureServer {
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to send encrypted server payload."));
     }
+  }
+
+  private sendRpcRequest(
+    socket: WebSocket,
+    event: string,
+    data: unknown,
+    timeoutMs: number
+  ): Promise<unknown> {
+    if (socket.readyState !== WebSocket.OPEN && socket.readyState !== WebSocket.CONNECTING) {
+      throw new Error("Client socket is not connected for ACK request.");
+    }
+
+    const pendingRequests =
+      this.pendingRpcRequestsBySocket.get(socket) ?? new Map<string, PendingRpcRequest>();
+    this.pendingRpcRequestsBySocket.set(socket, pendingRequests);
+
+    const requestId = randomUUID();
+
+    return new Promise<unknown>((resolve, reject) => {
+      const timeoutHandle = setTimeout(() => {
+        pendingRequests.delete(requestId);
+        reject(new Error(`ACK response timed out after ${timeoutMs}ms for event "${event}".`));
+      }, timeoutMs);
+
+      timeoutHandle.unref?.();
+
+      pendingRequests.set(requestId, {
+        resolve,
+        reject,
+        timeoutHandle
+      });
+
+      this.sendOrQueuePayload(socket, {
+        event: INTERNAL_RPC_REQUEST_EVENT,
+        data: {
+          id: requestId,
+          event,
+          data
+        } satisfies RpcRequestPayload
+      });
+    });
+  }
+
+  private handleRpcResponse(socket: WebSocket, data: unknown): void {
+    try {
+      const responsePayload = parseRpcResponsePayload(data);
+      const pendingRequests = this.pendingRpcRequestsBySocket.get(socket);
+
+      if (!pendingRequests) {
+        return;
+      }
+
+      const pendingRequest = pendingRequests.get(responsePayload.id);
+
+      if (!pendingRequest) {
+        return;
+      }
+
+      clearTimeout(pendingRequest.timeoutHandle);
+      pendingRequests.delete(responsePayload.id);
+
+      if (responsePayload.ok) {
+        pendingRequest.resolve(responsePayload.data);
+        return;
+      }
+
+      pendingRequest.reject(
+        new Error(responsePayload.error ?? "ACK request failed without an error message.")
+      );
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to process server ACK response."));
+    }
+  }
+
+  private async handleRpcRequest(client: SecureServerClient, data: unknown): Promise<void> {
+    let rpcRequestPayload: RpcRequestPayload;
+
+    try {
+      rpcRequestPayload = parseRpcRequestPayload(data);
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Invalid server ACK request payload."));
+      return;
+    }
+
+    try {
+      const ackResponse = await this.executeRpcRequestHandler(
+        rpcRequestPayload.event,
+        rpcRequestPayload.data,
+        client
+      );
+
+      this.sendEncryptedEnvelope(client.socket, {
+        event: INTERNAL_RPC_RESPONSE_EVENT,
+        data: {
+          id: rpcRequestPayload.id,
+          ok: true,
+          data: ackResponse
+        } satisfies RpcResponsePayload
+      });
+    } catch (error) {
+      const normalizedError = normalizeToError(error, "Server ACK request handler failed.");
+
+      this.sendEncryptedEnvelope(client.socket, {
+        event: INTERNAL_RPC_RESPONSE_EVENT,
+        data: {
+          id: rpcRequestPayload.id,
+          ok: false,
+          error: normalizedError.message
+        } satisfies RpcResponsePayload
+      });
+
+      this.notifyError(normalizedError);
+    }
+  }
+
+  private async executeRpcRequestHandler(
+    event: string,
+    data: unknown,
+    client: SecureServerClient
+  ): Promise<unknown> {
+    const handlers = this.customEventHandlers.get(event);
+
+    if (!handlers || handlers.size === 0) {
+      throw new Error(`No handler is registered for ACK request event "${event}".`);
+    }
+
+    const firstHandler = handlers.values().next().value as SecureServerEventHandler;
+    return Promise.resolve(firstHandler(data, client));
+  }
+
+  private rejectPendingRpcRequests(socket: WebSocket, error: Error): void {
+    const pendingRequests = this.pendingRpcRequestsBySocket.get(socket);
+
+    if (!pendingRequests) {
+      return;
+    }
+
+    for (const pendingRequest of pendingRequests.values()) {
+      clearTimeout(pendingRequest.timeoutHandle);
+      pendingRequest.reject(error);
+    }
+
+    pendingRequests.clear();
   }
 
   private notifyConnection(client: SecureServerClient): void {
@@ -1006,6 +1410,32 @@ export class SecureServer {
       id: clientId,
       socket,
       request,
+      emit: (
+        event: string,
+        data: unknown,
+        callbackOrOptions?: SecureAckCallback | SecureAckOptions,
+        maybeCallback?: SecureAckCallback
+      ): boolean | Promise<unknown> => {
+        if (callbackOrOptions === undefined && maybeCallback === undefined) {
+          return this.emitTo(clientId, event, data);
+        }
+
+        if (typeof callbackOrOptions === "function") {
+          return this.emitTo(clientId, event, data, callbackOrOptions);
+        }
+
+        if (maybeCallback) {
+          return this.emitTo(
+            clientId,
+            event,
+            data,
+            callbackOrOptions ?? {},
+            maybeCallback
+          );
+        }
+
+        return this.emitTo(clientId, event, data, callbackOrOptions ?? {});
+      },
       join: (room: string): boolean => this.joinClientToRoom(clientId, room),
       leave: (room: string): boolean => this.leaveClientFromRoom(clientId, room),
       leaveAll: (): number => this.leaveClientFromAllRooms(clientId)
@@ -1152,6 +1582,8 @@ export class SecureClient {
   private handshakeState: ClientHandshakeState | null = null;
 
   private pendingPayloadQueue: SecureEnvelope[] = [];
+
+  private readonly pendingRpcRequests = new Map<string, PendingRpcRequest>();
 
   public constructor(
     private readonly url: string,
@@ -1319,7 +1751,23 @@ export class SecureClient {
     return this;
   }
 
-  public emit(event: string, data: unknown): boolean {
+  public emit(event: string, data: unknown): boolean;
+  public emit(event: string, data: unknown, callback: SecureAckCallback): boolean;
+  public emit(event: string, data: unknown, options: SecureAckOptions): Promise<unknown>;
+  public emit(
+    event: string,
+    data: unknown,
+    options: SecureAckOptions,
+    callback: SecureAckCallback
+  ): boolean;
+  public emit(
+    event: string,
+    data: unknown,
+    callbackOrOptions?: SecureAckCallback | SecureAckOptions,
+    maybeCallback?: SecureAckCallback
+  ): boolean | Promise<unknown> {
+    const ackArgs = resolveAckArguments(callbackOrOptions, maybeCallback);
+
     try {
       if (isReservedEmitEvent(event)) {
         throw new Error(`The event "${event}" is reserved and cannot be emitted manually.`);
@@ -1327,6 +1775,26 @@ export class SecureClient {
 
       if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
         throw new Error("Client socket is not connected.");
+      }
+
+      if (ackArgs.expectsAck) {
+        const ackPromise = this.sendRpcRequest(event, data, ackArgs.timeoutMs);
+
+        if (ackArgs.callback) {
+          ackPromise
+            .then((response) => {
+              ackArgs.callback?.(null, response);
+            })
+            .catch((error) => {
+              ackArgs.callback?.(
+                normalizeToError(error, `ACK callback failed for event "${event}".`)
+              );
+            });
+
+          return true;
+        }
+
+        return ackPromise;
       }
 
       const envelope: SecureEnvelope = { event, data };
@@ -1339,7 +1807,18 @@ export class SecureClient {
       this.sendEncryptedEnvelope(envelope);
       return true;
     } catch (error) {
-      this.notifyError(normalizeToError(error, "Failed to emit client event."));
+      const normalizedError = normalizeToError(error, "Failed to emit client event.");
+      this.notifyError(normalizedError);
+
+      if (ackArgs.callback) {
+        ackArgs.callback(normalizedError);
+        return false;
+      }
+
+      if (ackArgs.expectsAck) {
+        return Promise.reject(normalizedError);
+      }
+
       return false;
     }
   }
@@ -1527,6 +2006,17 @@ export class SecureClient {
       }
 
       const decryptedEnvelope = parseEnvelopeFromText(decryptedPayload);
+
+      if (decryptedEnvelope.event === INTERNAL_RPC_RESPONSE_EVENT) {
+        this.handleRpcResponse(decryptedEnvelope.data);
+        return;
+      }
+
+      if (decryptedEnvelope.event === INTERNAL_RPC_REQUEST_EVENT) {
+        void this.handleRpcRequest(decryptedEnvelope.data);
+        return;
+      }
+
       this.dispatchCustomEvent(decryptedEnvelope.event, decryptedEnvelope.data);
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to process incoming client message."));
@@ -1538,6 +2028,9 @@ export class SecureClient {
       this.socket = null;
       this.handshakeState = null;
       this.pendingPayloadQueue = [];
+      this.rejectPendingRpcRequests(
+        new Error("Client disconnected before ACK response was received.")
+      );
       const decodedReason = decodeCloseReason(reason);
 
       for (const handler of this.disconnectHandlers) {
@@ -1569,7 +2062,18 @@ export class SecureClient {
 
     for (const handler of handlers) {
       try {
-        handler(data);
+        const handlerResult = handler(data);
+
+        if (isPromiseLike(handlerResult)) {
+          void Promise.resolve(handlerResult).catch((error) => {
+            this.notifyError(
+              normalizeToError(
+                error,
+                `Client event handler failed for event ${event}.`
+              )
+            );
+          });
+        }
       } catch (error) {
         this.notifyError(
           normalizeToError(error, `Client event handler failed for event ${event}.`)
@@ -1633,6 +2137,134 @@ export class SecureClient {
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to send encrypted client payload."));
     }
+  }
+
+  private sendRpcRequest(
+    event: string,
+    data: unknown,
+    timeoutMs: number
+  ): Promise<unknown> {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      throw new Error("Client socket is not connected for ACK request.");
+    }
+
+    const requestId = randomUUID();
+
+    return new Promise<unknown>((resolve, reject) => {
+      const timeoutHandle = setTimeout(() => {
+        this.pendingRpcRequests.delete(requestId);
+        reject(new Error(`ACK response timed out after ${timeoutMs}ms for event "${event}".`));
+      }, timeoutMs);
+
+      timeoutHandle.unref?.();
+
+      this.pendingRpcRequests.set(requestId, {
+        resolve,
+        reject,
+        timeoutHandle
+      });
+
+      const rpcRequestEnvelope: SecureEnvelope<RpcRequestPayload> = {
+        event: INTERNAL_RPC_REQUEST_EVENT,
+        data: {
+          id: requestId,
+          event,
+          data
+        }
+      };
+
+      if (!this.isHandshakeReady()) {
+        this.pendingPayloadQueue.push(rpcRequestEnvelope);
+        return;
+      }
+
+      this.sendEncryptedEnvelope(rpcRequestEnvelope);
+    });
+  }
+
+  private handleRpcResponse(data: unknown): void {
+    try {
+      const responsePayload = parseRpcResponsePayload(data);
+      const pendingRequest = this.pendingRpcRequests.get(responsePayload.id);
+
+      if (!pendingRequest) {
+        return;
+      }
+
+      clearTimeout(pendingRequest.timeoutHandle);
+      this.pendingRpcRequests.delete(responsePayload.id);
+
+      if (responsePayload.ok) {
+        pendingRequest.resolve(responsePayload.data);
+        return;
+      }
+
+      pendingRequest.reject(
+        new Error(responsePayload.error ?? "ACK request failed without an error message.")
+      );
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to process client ACK response."));
+    }
+  }
+
+  private async handleRpcRequest(data: unknown): Promise<void> {
+    let rpcRequestPayload: RpcRequestPayload;
+
+    try {
+      rpcRequestPayload = parseRpcRequestPayload(data);
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Invalid client ACK request payload."));
+      return;
+    }
+
+    try {
+      const ackResponse = await this.executeRpcRequestHandler(
+        rpcRequestPayload.event,
+        rpcRequestPayload.data
+      );
+
+      this.sendEncryptedEnvelope({
+        event: INTERNAL_RPC_RESPONSE_EVENT,
+        data: {
+          id: rpcRequestPayload.id,
+          ok: true,
+          data: ackResponse
+        } satisfies RpcResponsePayload
+      });
+    } catch (error) {
+      const normalizedError = normalizeToError(error, "Client ACK request handler failed.");
+
+      this.sendEncryptedEnvelope({
+        event: INTERNAL_RPC_RESPONSE_EVENT,
+        data: {
+          id: rpcRequestPayload.id,
+          ok: false,
+          error: normalizedError.message
+        } satisfies RpcResponsePayload
+      });
+
+      this.notifyError(normalizedError);
+    }
+  }
+
+  private async executeRpcRequestHandler(event: string, data: unknown): Promise<unknown> {
+    const handlers = this.customEventHandlers.get(event);
+
+    if (!handlers || handlers.size === 0) {
+      throw new Error(`No handler is registered for ACK request event "${event}".`);
+    }
+
+    const firstHandler = handlers.values().next().value as SecureClientEventHandler;
+    return Promise.resolve(firstHandler(data));
+  }
+
+  private rejectPendingRpcRequests(error: Error): void {
+    for (const pendingRequest of this.pendingRpcRequests.values()) {
+      clearTimeout(pendingRequest.timeoutHandle);
+      pendingRequest.reject(error);
+    }
+
+    this.pendingRpcRequests.clear();
   }
 
   private createClientHandshakeState(): ClientHandshakeState {

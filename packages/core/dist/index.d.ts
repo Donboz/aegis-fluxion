@@ -5,6 +5,10 @@ interface SecureEnvelope<TData = unknown> {
     event: string;
     data: TData;
 }
+interface SecureAckOptions {
+    timeoutMs?: number;
+}
+type SecureAckCallback = (error: Error | null, response?: unknown) => void;
 interface SecureServerHeartbeatOptions {
     enabled?: boolean;
     intervalMs?: number;
@@ -31,6 +35,7 @@ interface SecureServerClient {
     id: string;
     socket: WebSocket;
     request: IncomingMessage;
+    emit: (event: string, data: unknown, callbackOrOptions?: SecureAckCallback | SecureAckOptions, maybeCallback?: SecureAckCallback) => boolean | Promise<unknown>;
     join: (room: string) => boolean;
     leave: (room: string) => boolean;
     leaveAll: () => number;
@@ -39,11 +44,11 @@ interface SecureServerRoomOperator {
     emit: (event: string, data: unknown) => SecureServer;
 }
 type SecureErrorHandler = (error: Error) => void;
-type SecureServerEventHandler = (data: unknown, client: SecureServerClient) => void;
+type SecureServerEventHandler = (data: unknown, client: SecureServerClient) => unknown | Promise<unknown>;
 type SecureServerConnectionHandler = (client: SecureServerClient) => void;
 type SecureServerDisconnectHandler = (client: SecureServerClient, code: number, reason: string) => void;
 type SecureServerReadyHandler = (client: SecureServerClient) => void;
-type SecureClientEventHandler = (data: unknown) => void;
+type SecureClientEventHandler = (data: unknown) => unknown | Promise<unknown>;
 type SecureClientConnectHandler = () => void;
 type SecureClientDisconnectHandler = (code: number, reason: string) => void;
 type SecureClientReadyHandler = () => void;
@@ -76,6 +81,7 @@ declare class SecureServer {
     private readonly sharedSecretBySocket;
     private readonly encryptionKeyBySocket;
     private readonly pendingPayloadsBySocket;
+    private readonly pendingRpcRequestsBySocket;
     private readonly heartbeatStateBySocket;
     private readonly roomMembersByName;
     private readonly roomNamesByClientId;
@@ -94,6 +100,9 @@ declare class SecureServer {
     off(event: string, handler: SecureServerEventHandler): this;
     emit(event: string, data: unknown): this;
     emitTo(clientId: string, event: string, data: unknown): boolean;
+    emitTo(clientId: string, event: string, data: unknown, callback: SecureAckCallback): boolean;
+    emitTo(clientId: string, event: string, data: unknown, options: SecureAckOptions): Promise<unknown>;
+    emitTo(clientId: string, event: string, data: unknown, options: SecureAckOptions, callback: SecureAckCallback): boolean;
     to(room: string): SecureServerRoomOperator;
     close(code?: number, reason?: string): void;
     private resolveHeartbeatConfig;
@@ -108,6 +117,11 @@ declare class SecureServer {
     private dispatchCustomEvent;
     private sendRaw;
     private sendEncryptedEnvelope;
+    private sendRpcRequest;
+    private handleRpcResponse;
+    private handleRpcRequest;
+    private executeRpcRequestHandler;
+    private rejectPendingRpcRequests;
     private notifyConnection;
     private notifyReady;
     private notifyError;
@@ -140,6 +154,7 @@ declare class SecureClient {
     private readonly errorHandlers;
     private handshakeState;
     private pendingPayloadQueue;
+    private readonly pendingRpcRequests;
     constructor(url: string, options?: SecureClientOptions);
     get readyState(): number | null;
     isConnected(): boolean;
@@ -156,6 +171,9 @@ declare class SecureClient {
     off(event: "error", handler: SecureErrorHandler): this;
     off(event: string, handler: SecureClientEventHandler): this;
     emit(event: string, data: unknown): boolean;
+    emit(event: string, data: unknown, callback: SecureAckCallback): boolean;
+    emit(event: string, data: unknown, options: SecureAckOptions): Promise<unknown>;
+    emit(event: string, data: unknown, options: SecureAckOptions, callback: SecureAckCallback): boolean;
     private resolveReconnectConfig;
     private scheduleReconnect;
     private computeReconnectDelay;
@@ -169,6 +187,11 @@ declare class SecureClient {
     private notifyReady;
     private notifyError;
     private sendEncryptedEnvelope;
+    private sendRpcRequest;
+    private handleRpcResponse;
+    private handleRpcRequest;
+    private executeRpcRequestHandler;
+    private rejectPendingRpcRequests;
     private createClientHandshakeState;
     private sendInternalHandshake;
     private handleInternalHandshake;
@@ -176,4 +199,4 @@ declare class SecureClient {
     private flushPendingPayloadQueue;
 }
 
-export { SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureClientReconnectOptions, type SecureEnvelope, type SecureErrorHandler, SecureServer, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerHeartbeatOptions, type SecureServerLifecycleEvent, type SecureServerOptions, type SecureServerReadyHandler, type SecureServerRoomOperator };
+export { type SecureAckCallback, type SecureAckOptions, SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureClientReconnectOptions, type SecureEnvelope, type SecureErrorHandler, SecureServer, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerHeartbeatOptions, type SecureServerLifecycleEvent, type SecureServerOptions, type SecureServerReadyHandler, type SecureServerRoomOperator };

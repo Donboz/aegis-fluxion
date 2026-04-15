@@ -1,74 +1,37 @@
 # aegis-fluxion
 
-![Version](https://img.shields.io/badge/version-0.3.0-2563eb)
+![Version](https://img.shields.io/badge/version-0.4.0-2563eb)
 ![Node](https://img.shields.io/badge/node-%3E%3D18.18.0-16a34a)
 ![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178c6)
 ![Crypto](https://img.shields.io/badge/Crypto-ECDH%20%2B%20AES--256--GCM-0f172a)
 
-`aegis-fluxion` is a secure WebSocket toolkit for TypeScript/Node.js applications that need **application-layer encryption**, **secure room broadcasting**, and now **transport resilience** with:
+`aegis-fluxion` is an E2E-encrypted WebSocket toolkit for Node.js/TypeScript.
 
-- **Server heartbeat (Ping/Pong)** to detect and terminate zombie sockets
-- **Automatic in-memory key cleanup** for dead connections
-- **Client auto-reconnect with exponential backoff**
-- **Fresh handshake/tunnel establishment after reconnect**
+It provides:
 
----
-
-## Table of Contents
-
-- [What’s New in v0.3.0](#whats-new-in-v030)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-  - [Secure Server](#secure-server)
-  - [Secure Client](#secure-client)
-- [Resilience & Reconnection](#resilience--reconnection)
-  - [Server Heartbeat](#server-heartbeat)
-  - [Client Auto-Reconnect](#client-auto-reconnect)
-- [Secure Rooms](#secure-rooms)
-- [Security Model](#security-model)
-- [API Overview](#api-overview)
-- [Development](#development)
-- [License](#license)
+- **Ephemeral ECDH handshake** with **AES-256-GCM** encrypted application frames
+- **Secure rooms** for encrypted fanout routing
+- **Heartbeat Ping/Pong** for zombie connection cleanup
+- **Auto-reconnect with exponential backoff** and fresh tunnel re-handshake
+- **RPC-style ACK request/response** over the same encrypted tunnel
 
 ---
 
-## What’s New in v0.3.0
+## Why v0.4.0 matters
 
-### 1) Heartbeat-based zombie cleanup (server)
+`v0.4.0` introduces encrypted **Request-Response (ACK)** messaging.
 
-The server now sends periodic Ping frames and tracks Pong acknowledgements.
+You can now send events with:
 
-If a socket becomes unresponsive, the server will:
+- **Promise-based ACK** (`await` response)
+- **Callback-based ACK** (Node-style callback)
+- **Timeout protection** (reject/callback error if no response arrives)
 
-1. terminate the zombie socket,
-2. remove handshake/encryption material from memory,
-3. release queued payload state,
-4. trigger normal disconnect lifecycle.
-
-### 2) Exponential backoff reconnect (client)
-
-When the connection drops unexpectedly, the client now retries with configurable backoff:
-
-- initial delay,
-- factor,
-- max delay,
-- optional jitter,
-- optional max attempts.
-
-On each successful reconnect, the secure tunnel is rebuilt from scratch with a new ephemeral handshake.
+All ACK payloads and errors stay inside the E2E encrypted channel.
 
 ---
 
 ## Installation
-
-### Monorepo (this repository)
-
-```bash
-npm install
-npm run build
-```
-
-### Package usage
 
 ```bash
 npm install @aegis-fluxion/core ws
@@ -76,9 +39,9 @@ npm install @aegis-fluxion/core ws
 
 ---
 
-## Quick Start
+## Quick Example (Encrypted ACK)
 
-### Secure Server
+### Server
 
 ```ts
 import { SecureServer } from "@aegis-fluxion/core";
@@ -93,33 +56,23 @@ const server = new SecureServer({
   }
 });
 
-server.on("connection", (socket) => {
-  console.log(`connected: ${socket.id}`);
-  socket.join("agents:ops");
+server.on("ready", (client) => {
+  console.log("secure tunnel ready:", client.id);
 });
 
-server.on("ready", (socket) => {
-  console.log(`secure tunnel ready: ${socket.id}`);
-  server.emitTo(socket.id, "session:ready", { ok: true });
-});
+// RPC handler: return value becomes encrypted ACK response
+server.on("user:lookup", async (payload) => {
+  const { userId } = payload as { userId: string };
 
-server.on("chat:send", (payload, socket) => {
-  server.to("agents:ops").emit("chat:message", {
-    from: socket.id,
-    body: payload
-  });
-});
-
-server.on("disconnect", (socket, code, reason) => {
-  console.log(`disconnected: ${socket.id} (${code} ${reason})`);
-});
-
-server.on("error", (error) => {
-  console.error("server error:", error.message);
+  return {
+    userId,
+    role: "operator",
+    status: "active"
+  };
 });
 ```
 
-### Secure Client
+### Client (Promise ACK)
 
 ```ts
 import { SecureClient } from "@aegis-fluxion/core";
@@ -128,163 +81,79 @@ const client = new SecureClient("ws://127.0.0.1:8080", {
   autoConnect: true,
   reconnect: {
     enabled: true,
-    initialDelayMs: 300,
-    maxDelayMs: 10_000,
-    factor: 2,
-    jitterRatio: 0.2,
-    maxAttempts: null // null => unlimited retries
-  }
-});
-
-client.on("connect", () => {
-  console.log("transport connected");
-});
-
-client.on("ready", () => {
-  console.log("secure tunnel established");
-  client.emit("chat:send", "hello from resilient client");
-});
-
-client.on("chat:message", (payload) => {
-  console.log("secure room payload:", payload);
-});
-
-client.on("disconnect", (code, reason) => {
-  console.log(`transport disconnected: ${code} ${reason}`);
-});
-
-client.on("error", (error) => {
-  console.error("client error:", error.message);
-});
-```
-
----
-
-## Resilience & Reconnection
-
-### Server Heartbeat
-
-Use heartbeat options in `SecureServer` constructor:
-
-```ts
-new SecureServer({
-  port: 8080,
-  heartbeat: {
-    enabled: true,
-    intervalMs: 10_000,
-    timeoutMs: 12_000
-  }
-});
-```
-
-#### Heartbeat Behavior
-
-- Every `intervalMs`, the server sends Ping to open sockets.
-- If no Pong is received within `timeoutMs`, the socket is treated as zombie.
-- The server terminates the socket and clears encryption-related state from RAM.
-
-### Client Auto-Reconnect
-
-Use reconnect options in `SecureClient` constructor:
-
-```ts
-new SecureClient("ws://127.0.0.1:8080", {
-  reconnect: {
-    enabled: true,
     initialDelayMs: 250,
     factor: 2,
     maxDelayMs: 10_000,
     jitterRatio: 0.2,
-    maxAttempts: 25
+    maxAttempts: null
   }
 });
+
+client.on("ready", async () => {
+  const response = await client.emit(
+    "user:lookup",
+    { userId: "u-42" },
+    { timeoutMs: 2000 }
+  );
+
+  console.log("ACK response:", response);
+});
 ```
 
-#### Reconnect Behavior
-
-- Reconnect is triggered after unintentional disconnect.
-- Retry delay follows exponential backoff with optional jitter.
-- On reconnect success, handshake is run again and a fresh encryption key is derived.
-- Calling `client.disconnect()` is treated as manual stop (no auto-retry).
-
----
-
-## Secure Rooms
-
-Room APIs (server-side):
-
-- `socket.join(room)`
-- `socket.leave(room)`
-- `socket.leaveAll()`
-- `server.to(room).emit(event, data)`
-
-Example:
+### Client (Callback ACK)
 
 ```ts
-server.on("connection", (socket) => {
-  socket.join("alerts");
-});
+client.emit(
+  "user:lookup",
+  { userId: "u-99" },
+  { timeoutMs: 2000 },
+  (error, response) => {
+    if (error) {
+      console.error("ACK failed:", error.message);
+      return;
+    }
 
-server.to("alerts").emit("alert:new", {
-  severity: "high",
-  message: "Integrity check failed on worker-07"
+    console.log("ACK response:", response);
+  }
+);
+```
+
+---
+
+## Server-to-Client ACK
+
+Use `emitTo` with Promise or callback:
+
+```ts
+server.on("ready", async (client) => {
+  const response = await server.emitTo(
+    client.id,
+    "agent:health",
+    { verbose: true },
+    { timeoutMs: 1500 }
+  );
+
+  console.log("client ACK:", response);
 });
 ```
 
-Room broadcast remains encrypted per recipient.
+On the client side:
+
+```ts
+client.on("agent:health", () => {
+  return { ok: true, uptimeSec: process.uptime() };
+});
+```
 
 ---
 
-## Security Model
+## Resilience & Security
 
-### Handshake
-
-1. Client and server generate ephemeral ECDH keys (`prime256v1`).
-2. Public keys are exchanged over internal handshake events.
-3. Shared secret is derived independently on both sides.
-4. AES-256-GCM key material is derived from SHA-256.
-
-### Message Packet
-
-Encrypted packet structure:
-
-- `version` (1 byte)
-- `iv` (12 bytes)
-- `authTag` (16 bytes)
-- `ciphertext` (N bytes)
-
-Tampered encrypted payloads fail authentication and are dropped.
-
----
-
-## API Overview
-
-### `SecureServer`
-
-- `on("connection" | "ready" | "disconnect" | "error", handler)`
-- `on("custom:event", (data, socket) => void)`
-- `emit(event, data)`
-- `emitTo(clientId, event, data)`
-- `to(room).emit(event, data)`
-- `close(code?, reason?)`
-
-### `SecureServerClient`
-
-- `id: string`
-- `socket: WebSocket`
-- `join(room): boolean`
-- `leave(room): boolean`
-- `leaveAll(): number`
-
-### `SecureClient`
-
-- `connect()`
-- `disconnect(code?, reason?)`
-- `emit(event, data): boolean`
-- `isConnected(): boolean`
-- `readyState: number | null`
-- `on("connect" | "ready" | "disconnect" | "error", handler)`
-- `on("custom:event", handler)`
+- **Heartbeat** removes dead sockets and clears encryption material in memory
+- **Reconnect** retries transport with configurable exponential backoff
+- **Fresh handshake** runs after reconnect for new key derivation
+- **Tamper resistance**: AES-GCM auth failures are dropped
+- **Timeout safety**: pending ACK requests fail fast instead of hanging forever
 
 ---
 
@@ -293,54 +162,31 @@ Tampered encrypted payloads fail authentication and are dropped.
 From repository root:
 
 ```bash
+npm install
 npm run typecheck
 npm run test
 npm run build
 ```
 
-Project layout:
+---
 
-```text
-.
-├── package.json
-├── README.md
-└── packages/
-    └── core/
-        ├── src/
-        │   └── index.ts
-        ├── test/
-        │   └── index.test.ts
-        ├── tsconfig.json
-        └── tsup.config.ts
-```
+## Package Docs
+
+Detailed API documentation and advanced usage examples are available in:
+
+- `packages/core/README.md`
 
 ---
 
-## Publishing to an npm Organization
-
-This monorepo publishes the core package under the organization scope:
-
-- `@aegis-fluxion/core`
-
-From repository root:
+## Publish (Monorepo)
 
 ```bash
 npm whoami
 npm run release:core
 ```
 
-If you are not logged in yet:
-
-```bash
-npm login
-```
-
-After login, `npm run release:core` runs tests, builds the package, and publishes it as a public scoped package.
-
-> Tip: for CI/CD, prefer npm Trusted Publishing (OIDC) and provenance-enabled releases.
-
 ---
 
 ## License
 
-MIT License.
+MIT

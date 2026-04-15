@@ -359,6 +359,223 @@ describe("SecureServer and SecureClient encryption flow", () => {
     }
   });
 
+  it("supports encrypted ACK request-response from client using Promise and callback", async () => {
+    const port = await getFreePort();
+    const server = new SecureServer({ port, host: "127.0.0.1" });
+    const client = new SecureClient(`ws://127.0.0.1:${port}`);
+
+    try {
+      server.on("math:add", (payload) => {
+        const parsedPayload = payload as { a: number; b: number };
+
+        return {
+          total: parsedPayload.a + parsedPayload.b
+        };
+      });
+
+      await Promise.all([
+        withTimeout(
+          new Promise<void>((resolve) => {
+            server.on("ready", () => {
+              resolve();
+            });
+          }),
+          TEST_TIMEOUT_MS,
+          "server ready for client ACK test"
+        ),
+        withTimeout(
+          new Promise<void>((resolve) => {
+            client.on("ready", () => {
+              resolve();
+            });
+          }),
+          TEST_TIMEOUT_MS,
+          "client ready for client ACK test"
+        )
+      ]);
+
+      const promiseAckResponse = await withTimeout(
+        client.emit(
+          "math:add",
+          { a: 7, b: 5 },
+          { timeoutMs: 750 }
+        ) as Promise<unknown>,
+        TEST_TIMEOUT_MS,
+        "client ACK promise response"
+      );
+
+      expect(promiseAckResponse).toEqual({ total: 12 });
+
+      const callbackAckResponse = await withTimeout(
+        new Promise<unknown>((resolve, reject) => {
+          const emitted = client.emit(
+            "math:add",
+            { a: 10, b: 15 },
+            { timeoutMs: 750 },
+            (error, response) => {
+              if (error) {
+                reject(error);
+                return;
+              }
+
+              resolve(response);
+            }
+          );
+
+          expect(emitted).toBe(true);
+        }),
+        TEST_TIMEOUT_MS,
+        "client ACK callback response"
+      );
+
+      expect(callbackAckResponse).toEqual({ total: 25 });
+    } finally {
+      client.disconnect();
+      server.close();
+      await wait(30);
+    }
+  });
+
+  it("supports encrypted ACK request-response from server emitTo and applies timeout", async () => {
+    const port = await getFreePort();
+    const server = new SecureServer({ port, host: "127.0.0.1" });
+    const client = new SecureClient(`ws://127.0.0.1:${port}`);
+
+    try {
+      client.on("profile:fetch", (payload) => {
+        const parsedPayload = payload as { include: string[] };
+
+        return {
+          id: "agent-7",
+          include: parsedPayload.include
+        };
+      });
+
+      client.on("never:respond", () => {
+        return new Promise(() => {
+          return undefined;
+        });
+      });
+
+      const serverReadyClientPromise = withTimeout(
+        new Promise<string>((resolve) => {
+          server.on("ready", (socket) => {
+            resolve(socket.id);
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "server ready with client id for emitTo ACK test"
+      );
+
+      const clientReadyPromise = withTimeout(
+        new Promise<void>((resolve) => {
+          client.on("ready", () => {
+            resolve();
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "client ready for emitTo ACK test"
+      );
+
+      const [clientId] = await Promise.all([serverReadyClientPromise, clientReadyPromise]);
+
+      const promiseAckResponse = await withTimeout(
+        server.emitTo(
+          clientId,
+          "profile:fetch",
+          { include: ["id", "roles"] },
+          { timeoutMs: 750 }
+        ) as Promise<unknown>,
+        TEST_TIMEOUT_MS,
+        "server emitTo ACK promise response"
+      );
+
+      expect(promiseAckResponse).toEqual({
+        id: "agent-7",
+        include: ["id", "roles"]
+      });
+
+      const callbackAckResponse = await withTimeout(
+        new Promise<unknown>((resolve, reject) => {
+          const emitted = server.emitTo(
+            clientId,
+            "profile:fetch",
+            { include: ["permissions"] },
+            { timeoutMs: 750 },
+            (error, response) => {
+              if (error) {
+                reject(error);
+                return;
+              }
+
+              resolve(response);
+            }
+          );
+
+          expect(emitted).toBe(true);
+        }),
+        TEST_TIMEOUT_MS,
+        "server emitTo ACK callback response"
+      );
+
+      expect(callbackAckResponse).toEqual({
+        id: "agent-7",
+        include: ["permissions"]
+      });
+
+      await expect(
+        server.emitTo(clientId, "never:respond", { probe: true }, { timeoutMs: 110 })
+      ).rejects.toThrow(/timed out/i);
+    } finally {
+      client.disconnect();
+      server.close();
+      await wait(30);
+    }
+  });
+
+  it("times out client ACK requests when server handler never resolves", async () => {
+    const port = await getFreePort();
+    const server = new SecureServer({ port, host: "127.0.0.1" });
+    const client = new SecureClient(`ws://127.0.0.1:${port}`);
+
+    try {
+      server.on("never:respond:server", () => {
+        return new Promise(() => {
+          return undefined;
+        });
+      });
+
+      await Promise.all([
+        withTimeout(
+          new Promise<void>((resolve) => {
+            server.on("ready", () => {
+              resolve();
+            });
+          }),
+          TEST_TIMEOUT_MS,
+          "server ready for client ACK timeout"
+        ),
+        withTimeout(
+          new Promise<void>((resolve) => {
+            client.on("ready", () => {
+              resolve();
+            });
+          }),
+          TEST_TIMEOUT_MS,
+          "client ready for client ACK timeout"
+        )
+      ]);
+
+      await expect(
+        client.emit("never:respond:server", { probe: true }, { timeoutMs: 110 })
+      ).rejects.toThrow(/timed out/i);
+    } finally {
+      client.disconnect();
+      server.close();
+      await wait(30);
+    }
+  });
+
   it("cleans zombie sockets and in-memory keys when heartbeat pings are not acknowledged", async () => {
     const port = await getFreePort();
     const server = new SecureServer({
