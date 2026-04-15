@@ -358,4 +358,199 @@ describe("SecureServer and SecureClient encryption flow", () => {
       await wait(30);
     }
   });
+
+  it("cleans zombie sockets and in-memory keys when heartbeat pings are not acknowledged", async () => {
+    const port = await getFreePort();
+    const server = new SecureServer({
+      port,
+      host: "127.0.0.1",
+      heartbeat: {
+        intervalMs: 40,
+        timeoutMs: 80
+      }
+    });
+    const client = new SecureClient(`ws://127.0.0.1:${port}`, {
+      reconnect: false
+    });
+
+    try {
+      const serverReadyPromise = withTimeout(
+        new Promise<string>((resolve) => {
+          server.on("ready", (socket) => {
+            resolve(socket.id);
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "server ready event for heartbeat test"
+      );
+
+      const clientReadyPromise = withTimeout(
+        new Promise<void>((resolve) => {
+          client.on("ready", () => {
+            resolve();
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "client ready event for heartbeat test"
+      );
+
+      const [readyClientId] = await Promise.all([serverReadyPromise, clientReadyPromise]);
+
+      const unsafeClientSocket = (
+        client as unknown as { socket: WebSocket | null }
+      ).socket;
+
+      if (!unsafeClientSocket || unsafeClientSocket.readyState !== WebSocket.OPEN) {
+        throw new Error("Unsafe socket accessor was unavailable for heartbeat test.");
+      }
+
+      const blockPongSpy = vi
+        .spyOn(unsafeClientSocket, "pong")
+        .mockImplementation(() => {
+          return undefined;
+        });
+
+      const disconnectPromise = withTimeout(
+        new Promise<{ code: number; reason: string }>((resolve) => {
+          server.on("disconnect", (socket, code, reason) => {
+            if (socket.id === readyClientId) {
+              resolve({ code, reason });
+            }
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "heartbeat disconnect event"
+      );
+
+      const disconnectPayload = await disconnectPromise;
+
+      const internalServerState = server as unknown as {
+        encryptionKeyBySocket: WeakMap<WebSocket, Buffer>;
+        sharedSecretBySocket: WeakMap<WebSocket, Buffer>;
+      };
+
+      expect(blockPongSpy).toHaveBeenCalled();
+      expect(disconnectPayload.code).toBe(1006);
+      expect(server.clientCount).toBe(0);
+      expect(internalServerState.encryptionKeyBySocket.get(unsafeClientSocket)).toBeUndefined();
+      expect(internalServerState.sharedSecretBySocket.get(unsafeClientSocket)).toBeUndefined();
+    } finally {
+      client.disconnect();
+      server.close();
+      await wait(30);
+    }
+  });
+
+  it("automatically reconnects with backoff and re-establishes a fresh encrypted tunnel", async () => {
+    const port = await getFreePort();
+    let server = new SecureServer({ port, host: "127.0.0.1" });
+
+    const attachProbeHandlers = (target: SecureServer): void => {
+      target.on("resilience:probe", (payload, socket) => {
+        target.emitTo(socket.id, "resilience:ack", {
+          ok: true,
+          probe: payload
+        });
+      });
+    };
+
+    attachProbeHandlers(server);
+
+    const client = new SecureClient(`ws://127.0.0.1:${port}`, {
+      reconnect: {
+        enabled: true,
+        initialDelayMs: 30,
+        maxDelayMs: 120,
+        factor: 2,
+        jitterRatio: 0,
+        maxAttempts: 20
+      }
+    });
+
+    try {
+      let firstHandshakePublicKey: string | null = null;
+
+      const secondReadyPromise = withTimeout(
+        new Promise<string>((resolve, reject) => {
+          client.on("ready", () => {
+            const handshakeState = (
+              client as unknown as { handshakeState?: { localPublicKey?: unknown } }
+            ).handshakeState;
+
+            if (!handshakeState || typeof handshakeState.localPublicKey !== "string") {
+              reject(new Error("Handshake state was unavailable on ready event."));
+              return;
+            }
+
+            if (firstHandshakePublicKey === null) {
+              firstHandshakePublicKey = handshakeState.localPublicKey;
+              return;
+            }
+
+            resolve(handshakeState.localPublicKey);
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "second ready event after reconnect"
+      );
+
+      await withTimeout(
+        new Promise<void>((resolve) => {
+          const checkFirstReady = (): void => {
+            if (firstHandshakePublicKey !== null) {
+              resolve();
+              return;
+            }
+
+            setTimeout(checkFirstReady, 10);
+          };
+
+          checkFirstReady();
+        }),
+        TEST_TIMEOUT_MS,
+        "first ready event"
+      );
+
+      server.close();
+      await wait(120);
+
+      server = new SecureServer({ port, host: "127.0.0.1" });
+      attachProbeHandlers(server);
+
+      const secondHandshakePublicKey = await secondReadyPromise;
+
+      expect(firstHandshakePublicKey).not.toBeNull();
+      expect(secondHandshakePublicKey).not.toBe(firstHandshakePublicKey);
+
+      const ackPromise = withTimeout(
+        new Promise<unknown>((resolve) => {
+          client.on("resilience:ack", (payload) => {
+            resolve(payload);
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "reconnected encrypted ack"
+      );
+
+      expect(
+        client.emit("resilience:probe", {
+          attempt: "after-reconnect"
+        })
+      ).toBe(true);
+
+      const ackPayload = await ackPromise;
+
+      expect(ackPayload).toEqual({
+        ok: true,
+        probe: {
+          attempt: "after-reconnect"
+        }
+      });
+      expect(client.isConnected()).toBe(true);
+    } finally {
+      client.disconnect();
+      server.close();
+      await wait(30);
+    }
+  });
 });

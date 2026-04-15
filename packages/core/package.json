@@ -1,6 +1,6 @@
 {
   "name": "@aegis-fluxion/core",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Core WebSocket primitives for aegis-fluxion.",
   "type": "module",
   "main": "./dist/index.cjs",

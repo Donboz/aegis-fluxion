@@ -1,64 +1,63 @@
 # aegis-fluxion
 
-![Version](https://img.shields.io/badge/version-0.2.0-2563eb)
+![Version](https://img.shields.io/badge/version-0.3.0-2563eb)
 ![Node](https://img.shields.io/badge/node-%3E%3D18.18.0-16a34a)
 ![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178c6)
 ![Crypto](https://img.shields.io/badge/Crypto-ECDH%20%2B%20AES--256--GCM-0f172a)
 
-Secure, production-ready WebSocket transport primitives for modern TypeScript systems.
+`aegis-fluxion` is a secure WebSocket toolkit for TypeScript/Node.js applications that need **application-layer encryption**, **secure room broadcasting**, and now **transport resilience** with:
 
-`aegis-fluxion` provides **application-layer end-to-end encryption** and now includes **Secure Rooms** with Socket.IO-like ergonomics:
+- **Server heartbeat (Ping/Pong)** to detect and terminate zombie sockets
+- **Automatic in-memory key cleanup** for dead connections
+- **Client auto-reconnect with exponential backoff**
+- **Fresh handshake/tunnel establishment after reconnect**
 
-- `socket.join("room")`
-- `socket.leave("room")`
-- `server.to("room").emit("event", data)`
-
-> Even when broadcasting to a room, each recipient receives a separately encrypted packet using that connection’s own ECDH-derived AES-GCM key.
+---
 
 ## Table of Contents
 
-- [Why aegis-fluxion](#why-aegis-fluxion)
-- [What’s New in v0.2.0](#whats-new-in-v020)
+- [What’s New in v0.3.0](#whats-new-in-v030)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
   - [Secure Server](#secure-server)
   - [Secure Client](#secure-client)
+- [Resilience & Reconnection](#resilience--reconnection)
+  - [Server Heartbeat](#server-heartbeat)
+  - [Client Auto-Reconnect](#client-auto-reconnect)
 - [Secure Rooms](#secure-rooms)
-- [Security Architecture](#security-architecture)
+- [Security Model](#security-model)
 - [API Overview](#api-overview)
-- [Testing](#testing)
-- [Project Structure](#project-structure)
-- [AI & MCP Vision](#ai--mcp-vision)
-- [Operational Notes](#operational-notes)
+- [Development](#development)
 - [License](#license)
 
-## Why aegis-fluxion
+---
 
-TLS is necessary, but for many systems it is not sufficient.
+## What’s New in v0.3.0
 
-When traffic crosses proxies, gateways, sidecars, or long-lived internal meshes, application-level payload protection becomes essential.
+### 1) Heartbeat-based zombie cleanup (server)
 
-`aegis-fluxion` adds protocol-native cryptographic guarantees directly into your event flow:
+The server now sends periodic Ping frames and tracks Pong acknowledgements.
 
-- Ephemeral ECDH handshake per connection (PFS-oriented)
-- AES-256-GCM authenticated encryption for each message
-- Tamper rejection by default
-- Clean developer API with no cryptography boilerplate in business handlers
+If a socket becomes unresponsive, the server will:
 
-## What’s New in v0.2.0
+1. terminate the zombie socket,
+2. remove handshake/encryption material from memory,
+3. release queued payload state,
+4. trigger normal disconnect lifecycle.
 
-### Secure Rooms
+### 2) Exponential backoff reconnect (client)
 
-- Added server-side room membership management:
-  - `socket.join(room)`
-  - `socket.leave(room)`
-  - `socket.leaveAll()`
-- Added room-targeted emit API:
-  - `server.to(room).emit(event, data)`
+When the connection drops unexpectedly, the client now retries with configurable backoff:
 
-### Cryptographic Safety Preserved
+- initial delay,
+- factor,
+- max delay,
+- optional jitter,
+- optional max attempts.
 
-Room broadcasts do **not** use a shared room key. Instead, the server encrypts per recipient, per packet, with that recipient’s own session key.
+On each successful reconnect, the secure tunnel is rebuilt from scratch with a new ephemeral handshake.
+
+---
 
 ## Installation
 
@@ -75,7 +74,7 @@ npm run build
 npm install @aegis-fluxion/core ws
 ```
 
-> The cryptographic layer uses native Node.js `crypto` only (no third-party crypto package).
+---
 
 ## Quick Start
 
@@ -86,23 +85,25 @@ import { SecureServer } from "@aegis-fluxion/core";
 
 const server = new SecureServer({
   host: "127.0.0.1",
-  port: 8080
+  port: 8080,
+  heartbeat: {
+    enabled: true,
+    intervalMs: 15_000,
+    timeoutMs: 15_000
+  }
 });
 
 server.on("connection", (socket) => {
-  console.log(`Connected: ${socket.id}`);
-
-  // Room assignment on connection
+  console.log(`connected: ${socket.id}`);
   socket.join("agents:ops");
 });
 
 server.on("ready", (socket) => {
-  console.log(`Secure channel ready: ${socket.id}`);
+  console.log(`secure tunnel ready: ${socket.id}`);
   server.emitTo(socket.id, "session:ready", { ok: true });
 });
 
 server.on("chat:send", (payload, socket) => {
-  // Route only to room members, still encrypted per recipient.
   server.to("agents:ops").emit("chat:message", {
     from: socket.id,
     body: payload
@@ -110,11 +111,11 @@ server.on("chat:send", (payload, socket) => {
 });
 
 server.on("disconnect", (socket, code, reason) => {
-  console.log(`Disconnected: ${socket.id} (${code} ${reason})`);
+  console.log(`disconnected: ${socket.id} (${code} ${reason})`);
 });
 
 server.on("error", (error) => {
-  console.error("Secure server error:", error.message);
+  console.error("server error:", error.message);
 });
 ```
 
@@ -124,127 +125,172 @@ server.on("error", (error) => {
 import { SecureClient } from "@aegis-fluxion/core";
 
 const client = new SecureClient("ws://127.0.0.1:8080", {
-  autoConnect: true
+  autoConnect: true,
+  reconnect: {
+    enabled: true,
+    initialDelayMs: 300,
+    maxDelayMs: 10_000,
+    factor: 2,
+    jitterRatio: 0.2,
+    maxAttempts: null // null => unlimited retries
+  }
 });
 
 client.on("connect", () => {
-  console.log("Transport connected, waiting for cryptographic ready...");
+  console.log("transport connected");
 });
 
 client.on("ready", () => {
-  console.log("Secure channel established.");
-  client.emit("chat:send", "hello secure room");
-});
-
-client.on("session:ready", (payload) => {
-  console.log("Server session ack:", payload);
+  console.log("secure tunnel established");
+  client.emit("chat:send", "hello from resilient client");
 });
 
 client.on("chat:message", (payload) => {
-  console.log("Encrypted room message received:", payload);
+  console.log("secure room payload:", payload);
 });
 
 client.on("disconnect", (code, reason) => {
-  console.log(`Disconnected: ${code} ${reason}`);
+  console.log(`transport disconnected: ${code} ${reason}`);
 });
 
 client.on("error", (error) => {
-  console.error("Secure client error:", error.message);
+  console.error("client error:", error.message);
 });
 ```
 
+---
+
+## Resilience & Reconnection
+
+### Server Heartbeat
+
+Use heartbeat options in `SecureServer` constructor:
+
+```ts
+new SecureServer({
+  port: 8080,
+  heartbeat: {
+    enabled: true,
+    intervalMs: 10_000,
+    timeoutMs: 12_000
+  }
+});
+```
+
+**Behavior**
+
+- Every `intervalMs`, the server sends Ping to open sockets.
+- If no Pong is received within `timeoutMs`, the socket is treated as zombie.
+- The server terminates the socket and clears encryption-related state from RAM.
+
+### Client Auto-Reconnect
+
+Use reconnect options in `SecureClient` constructor:
+
+```ts
+new SecureClient("ws://127.0.0.1:8080", {
+  reconnect: {
+    enabled: true,
+    initialDelayMs: 250,
+    factor: 2,
+    maxDelayMs: 10_000,
+    jitterRatio: 0.2,
+    maxAttempts: 25
+  }
+});
+```
+
+**Behavior**
+
+- Reconnect is triggered after unintentional disconnect.
+- Retry delay follows exponential backoff with optional jitter.
+- On reconnect success, handshake is run again and a fresh encryption key is derived.
+- Calling `client.disconnect()` is treated as manual stop (no auto-retry).
+
+---
+
 ## Secure Rooms
 
-Rooms are managed server-side and designed for strict encrypted delivery.
+Room APIs (server-side):
+
+- `socket.join(room)`
+- `socket.leave(room)`
+- `socket.leaveAll()`
+- `server.to(room).emit(event, data)`
+
+Example:
 
 ```ts
 server.on("connection", (socket) => {
   socket.join("alerts");
 });
 
-// Later in business logic
 server.to("alerts").emit("alert:new", {
   severity: "high",
   message: "Integrity check failed on worker-07"
 });
 ```
 
-Remove a socket from a room:
+Room broadcast remains encrypted per recipient.
 
-```ts
-server.on("mute:alerts", (_, socket) => {
-  socket.leave("alerts");
-});
-```
+---
 
-> No plaintext fan-out is performed for rooms. Each outbound payload is serialized and encrypted separately for each destination socket.
-
-## Security Architecture
+## Security Model
 
 ### Handshake
 
 1. Client and server generate ephemeral ECDH keys (`prime256v1`).
-2. Public keys are exchanged via internal handshake event.
-3. Shared secret is derived on both ends.
-4. AES key material is derived via SHA-256 (`32 bytes`).
+2. Public keys are exchanged over internal handshake events.
+3. Shared secret is derived independently on both sides.
+4. AES-256-GCM key material is derived from SHA-256.
 
-### Packet Format
+### Message Packet
 
-Every encrypted payload is structured as:
+Encrypted packet structure:
 
 - `version` (1 byte)
 - `iv` (12 bytes)
 - `authTag` (16 bytes)
 - `ciphertext` (N bytes)
 
-### Confidentiality + Integrity
+Tampered encrypted payloads fail authentication and are dropped.
 
-- Cipher: `AES-256-GCM`
-- New IV per message
-- Auth tag required for successful decryption
-- Tampered payloads are dropped silently from business event dispatch
-
-### Secure Rooms Guarantee
-
-When `server.to(room).emit(...)` is called:
-
-- The room membership set is resolved on server side.
-- The same logical event is encrypted individually for each socket.
-- Each encryption operation uses that socket’s own ECDH-derived session key.
-
-This preserves E2E semantics for room broadcasts.
+---
 
 ## API Overview
 
 ### `SecureServer`
 
-- `on("connection", handler)`
-- `on("ready", handler)`
-- `on("disconnect", handler)`
-- `on("error", handler)`
-- `on("event", (data, socket) => void)`
-- `emit(event, data)` (broadcast to all connected sockets)
+- `on("connection" | "ready" | "disconnect" | "error", handler)`
+- `on("custom:event", (data, socket) => void)`
+- `emit(event, data)`
 - `emitTo(clientId, event, data)`
 - `to(room).emit(event, data)`
 - `close(code?, reason?)`
 
-### `SecureServerClient` (socket object on server)
+### `SecureServerClient`
 
 - `id: string`
+- `socket: WebSocket`
 - `join(room): boolean`
 - `leave(room): boolean`
 - `leaveAll(): number`
 
 ### `SecureClient`
 
-- `connect()` / `disconnect(code?, reason?)`
-- `emit(event, data)`
+- `connect()`
+- `disconnect(code?, reason?)`
+- `emit(event, data): boolean`
+- `isConnected(): boolean`
+- `readyState: number | null`
 - `on("connect" | "ready" | "disconnect" | "error", handler)`
-- `on("event", handler)`
+- `on("custom:event", handler)`
 
-## Testing
+---
 
-Run all checks from the repository root:
+## Development
+
+From repository root:
 
 ```bash
 npm run typecheck
@@ -252,13 +298,7 @@ npm run test
 npm run build
 ```
 
-Current integration coverage includes:
-
-- encrypted client/server exchange
-- tampered packet rejection without transport crash
-- secure rooms join/leave and room-scoped emits
-
-## Project Structure
+Project layout:
 
 ```text
 .
@@ -274,22 +314,7 @@ Current integration coverage includes:
         └── tsup.config.ts
 ```
 
-## AI & MCP Vision
-
-`aegis-fluxion` is built for systems that need cryptographically hardened event transport, including:
-
-- AI agent backplanes
-- MCP transport adapters
-- multi-agent orchestration channels
-- secure tool execution networks
-
-By keeping security protocol-native and API-minimal, teams can integrate hardened messaging without rewriting application business logic.
-
-## Operational Notes
-
-- Use `wss://` in production (transport confidentiality + endpoint authentication).
-- Application-layer encryption in `aegis-fluxion` complements TLS; it does not replace infrastructure security.
-- Add authentication, authorization, and rate limiting at the edge/service layer.
+---
 
 ## License
 

@@ -5,12 +5,27 @@ interface SecureEnvelope<TData = unknown> {
     event: string;
     data: TData;
 }
+interface SecureServerHeartbeatOptions {
+    enabled?: boolean;
+    intervalMs?: number;
+    timeoutMs?: number;
+}
 interface SecureServerOptions extends ServerOptions {
+    heartbeat?: SecureServerHeartbeatOptions;
+}
+interface SecureClientReconnectOptions {
+    enabled?: boolean;
+    initialDelayMs?: number;
+    maxDelayMs?: number;
+    factor?: number;
+    jitterRatio?: number;
+    maxAttempts?: number | null;
 }
 interface SecureClientOptions {
     protocols?: string | string[];
     wsOptions?: ClientOptions;
     autoConnect?: boolean;
+    reconnect?: boolean | SecureClientReconnectOptions;
 }
 interface SecureServerClient {
     id: string;
@@ -48,6 +63,8 @@ interface SecureClientEventMap {
 }
 declare class SecureServer {
     private readonly socketServer;
+    private readonly heartbeatConfig;
+    private heartbeatIntervalHandle;
     private readonly clientsById;
     private readonly clientIdBySocket;
     private readonly customEventHandlers;
@@ -59,6 +76,7 @@ declare class SecureServer {
     private readonly sharedSecretBySocket;
     private readonly encryptionKeyBySocket;
     private readonly pendingPayloadsBySocket;
+    private readonly heartbeatStateBySocket;
     private readonly roomMembersByName;
     private readonly roomNamesByClientId;
     constructor(options: SecureServerOptions);
@@ -78,6 +96,11 @@ declare class SecureServer {
     emitTo(clientId: string, event: string, data: unknown): boolean;
     to(room: string): SecureServerRoomOperator;
     close(code?: number, reason?: string): void;
+    private resolveHeartbeatConfig;
+    private startHeartbeatLoop;
+    private stopHeartbeatLoop;
+    private performHeartbeatSweep;
+    private handleHeartbeatPong;
     private bindSocketServerEvents;
     private handleConnection;
     private handleIncomingMessage;
@@ -106,6 +129,10 @@ declare class SecureClient {
     private readonly url;
     private readonly options;
     private socket;
+    private readonly reconnectConfig;
+    private reconnectAttemptCount;
+    private reconnectTimer;
+    private isManualDisconnectRequested;
     private readonly customEventHandlers;
     private readonly connectHandlers;
     private readonly disconnectHandlers;
@@ -129,6 +156,10 @@ declare class SecureClient {
     off(event: "error", handler: SecureErrorHandler): this;
     off(event: string, handler: SecureClientEventHandler): this;
     emit(event: string, data: unknown): boolean;
+    private resolveReconnectConfig;
+    private scheduleReconnect;
+    private computeReconnectDelay;
+    private clearReconnectTimer;
     private createSocket;
     private bindSocketEvents;
     private handleIncomingMessage;
@@ -145,4 +176,4 @@ declare class SecureClient {
     private flushPendingPayloadQueue;
 }
 
-export { SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureEnvelope, type SecureErrorHandler, SecureServer, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerLifecycleEvent, type SecureServerOptions, type SecureServerReadyHandler, type SecureServerRoomOperator };
+export { SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureClientReconnectOptions, type SecureEnvelope, type SecureErrorHandler, SecureServer, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerHeartbeatOptions, type SecureServerLifecycleEvent, type SecureServerOptions, type SecureServerReadyHandler, type SecureServerRoomOperator };

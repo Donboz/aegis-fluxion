@@ -19,6 +19,12 @@ var GCM_AUTH_TAG_LENGTH = 16;
 var ENCRYPTION_KEY_LENGTH = 32;
 var ENCRYPTED_PACKET_VERSION = 1;
 var ENCRYPTED_PACKET_PREFIX_LENGTH = 1 + GCM_IV_LENGTH + GCM_AUTH_TAG_LENGTH;
+var DEFAULT_HEARTBEAT_INTERVAL_MS = 15e3;
+var DEFAULT_HEARTBEAT_TIMEOUT_MS = 15e3;
+var DEFAULT_RECONNECT_INITIAL_DELAY_MS = 250;
+var DEFAULT_RECONNECT_MAX_DELAY_MS = 1e4;
+var DEFAULT_RECONNECT_FACTOR = 2;
+var DEFAULT_RECONNECT_JITTER_RATIO = 0.2;
 function normalizeToError(error, fallbackMessage) {
   if (error instanceof Error) {
     return error;
@@ -166,6 +172,8 @@ function decryptSerializedEnvelope(rawData, encryptionKey) {
 }
 var SecureServer = class {
   socketServer;
+  heartbeatConfig;
+  heartbeatIntervalHandle = null;
   clientsById = /* @__PURE__ */ new Map();
   clientIdBySocket = /* @__PURE__ */ new Map();
   customEventHandlers = /* @__PURE__ */ new Map();
@@ -177,11 +185,15 @@ var SecureServer = class {
   sharedSecretBySocket = /* @__PURE__ */ new WeakMap();
   encryptionKeyBySocket = /* @__PURE__ */ new WeakMap();
   pendingPayloadsBySocket = /* @__PURE__ */ new WeakMap();
+  heartbeatStateBySocket = /* @__PURE__ */ new WeakMap();
   roomMembersByName = /* @__PURE__ */ new Map();
   roomNamesByClientId = /* @__PURE__ */ new Map();
   constructor(options) {
-    this.socketServer = new WebSocket.WebSocketServer(options);
+    const { heartbeat, ...socketServerOptions } = options;
+    this.heartbeatConfig = this.resolveHeartbeatConfig(heartbeat);
+    this.socketServer = new WebSocket.WebSocketServer(socketServerOptions);
     this.bindSocketServerEvents();
+    this.startHeartbeatLoop();
   }
   get clientCount() {
     return this.clientsById.size;
@@ -304,6 +316,7 @@ var SecureServer = class {
   }
   close(code = DEFAULT_CLOSE_CODE, reason = DEFAULT_CLOSE_REASON) {
     try {
+      this.stopHeartbeatLoop();
       for (const client of this.clientsById.values()) {
         if (client.socket.readyState === WebSocket__default.default.OPEN || client.socket.readyState === WebSocket__default.default.CONNECTING) {
           client.socket.close(code, reason);
@@ -313,6 +326,81 @@ var SecureServer = class {
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to close server."));
     }
+  }
+  resolveHeartbeatConfig(heartbeatOptions) {
+    const intervalMs = heartbeatOptions?.intervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
+    const timeoutMs = heartbeatOptions?.timeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS;
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+      throw new Error("Server heartbeat intervalMs must be a positive number.");
+    }
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new Error("Server heartbeat timeoutMs must be a positive number.");
+    }
+    return {
+      enabled: heartbeatOptions?.enabled ?? true,
+      intervalMs,
+      timeoutMs
+    };
+  }
+  startHeartbeatLoop() {
+    if (!this.heartbeatConfig.enabled || this.heartbeatIntervalHandle) {
+      return;
+    }
+    this.heartbeatIntervalHandle = setInterval(() => {
+      this.performHeartbeatSweep();
+    }, this.heartbeatConfig.intervalMs);
+    this.heartbeatIntervalHandle.unref?.();
+  }
+  stopHeartbeatLoop() {
+    if (!this.heartbeatIntervalHandle) {
+      return;
+    }
+    clearInterval(this.heartbeatIntervalHandle);
+    this.heartbeatIntervalHandle = null;
+  }
+  performHeartbeatSweep() {
+    const now = Date.now();
+    for (const client of this.clientsById.values()) {
+      const socket = client.socket;
+      if (socket.readyState !== WebSocket__default.default.OPEN) {
+        continue;
+      }
+      const heartbeatState = this.heartbeatStateBySocket.get(socket) ?? {
+        awaitingPong: false,
+        lastPingAt: 0
+      };
+      if (heartbeatState.awaitingPong && now - heartbeatState.lastPingAt >= this.heartbeatConfig.timeoutMs) {
+        this.sharedSecretBySocket.delete(socket);
+        this.encryptionKeyBySocket.delete(socket);
+        this.pendingPayloadsBySocket.delete(socket);
+        this.handshakeStateBySocket.delete(socket);
+        this.heartbeatStateBySocket.delete(socket);
+        socket.terminate();
+        continue;
+      }
+      if (heartbeatState.awaitingPong) {
+        continue;
+      }
+      heartbeatState.awaitingPong = true;
+      heartbeatState.lastPingAt = now;
+      this.heartbeatStateBySocket.set(socket, heartbeatState);
+      try {
+        socket.ping();
+      } catch (error) {
+        this.notifyError(
+          normalizeToError(error, `Failed to send heartbeat ping to client ${client.id}.`)
+        );
+      }
+    }
+  }
+  handleHeartbeatPong(socket) {
+    const heartbeatState = this.heartbeatStateBySocket.get(socket);
+    if (!heartbeatState) {
+      return;
+    }
+    heartbeatState.awaitingPong = false;
+    heartbeatState.lastPingAt = 0;
+    this.heartbeatStateBySocket.set(socket, heartbeatState);
   }
   bindSocketServerEvents() {
     this.socketServer.on("connection", (socket, request) => {
@@ -331,12 +419,19 @@ var SecureServer = class {
       this.clientIdBySocket.set(socket, clientId);
       this.handshakeStateBySocket.set(socket, handshakeState);
       this.pendingPayloadsBySocket.set(socket, []);
+      this.heartbeatStateBySocket.set(socket, {
+        awaitingPong: false,
+        lastPingAt: 0
+      });
       this.roomNamesByClientId.set(clientId, /* @__PURE__ */ new Set());
       socket.on("message", (rawData) => {
         this.handleIncomingMessage(client, rawData);
       });
       socket.on("close", (code, reason) => {
         this.handleDisconnection(client, code, reason);
+      });
+      socket.on("pong", () => {
+        this.handleHeartbeatPong(client.socket);
       });
       socket.on("error", (error) => {
         this.notifyError(
@@ -405,6 +500,7 @@ var SecureServer = class {
       this.sharedSecretBySocket.delete(client.socket);
       this.encryptionKeyBySocket.delete(client.socket);
       this.pendingPayloadsBySocket.delete(client.socket);
+      this.heartbeatStateBySocket.delete(client.socket);
       const decodedReason = decodeCloseReason(reason);
       for (const handler of this.disconnectHandlers) {
         try {
@@ -661,6 +757,7 @@ var SecureClient = class {
   constructor(url, options = {}) {
     this.url = url;
     this.options = options;
+    this.reconnectConfig = this.resolveReconnectConfig(this.options.reconnect);
     if (this.options.autoConnect ?? true) {
       this.connect();
     }
@@ -668,6 +765,10 @@ var SecureClient = class {
   url;
   options;
   socket = null;
+  reconnectConfig;
+  reconnectAttemptCount = 0;
+  reconnectTimer = null;
+  isManualDisconnectRequested = false;
   customEventHandlers = /* @__PURE__ */ new Map();
   connectHandlers = /* @__PURE__ */ new Set();
   disconnectHandlers = /* @__PURE__ */ new Set();
@@ -686,6 +787,8 @@ var SecureClient = class {
       if (this.socket && (this.socket.readyState === WebSocket__default.default.OPEN || this.socket.readyState === WebSocket__default.default.CONNECTING)) {
         return;
       }
+      this.clearReconnectTimer();
+      this.isManualDisconnectRequested = false;
       const socket = this.createSocket();
       this.socket = socket;
       this.handshakeState = this.createClientHandshakeState();
@@ -693,10 +796,15 @@ var SecureClient = class {
       this.bindSocketEvents(socket);
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to connect client."));
+      if (!this.isManualDisconnectRequested) {
+        this.scheduleReconnect();
+      }
     }
   }
   disconnect(code = DEFAULT_CLOSE_CODE, reason = DEFAULT_CLOSE_REASON) {
     try {
+      this.isManualDisconnectRequested = true;
+      this.clearReconnectTimer();
       if (!this.socket) {
         return;
       }
@@ -796,6 +904,83 @@ var SecureClient = class {
       return false;
     }
   }
+  resolveReconnectConfig(reconnectOptions) {
+    if (typeof reconnectOptions === "boolean") {
+      return {
+        enabled: reconnectOptions,
+        initialDelayMs: DEFAULT_RECONNECT_INITIAL_DELAY_MS,
+        maxDelayMs: DEFAULT_RECONNECT_MAX_DELAY_MS,
+        factor: DEFAULT_RECONNECT_FACTOR,
+        jitterRatio: DEFAULT_RECONNECT_JITTER_RATIO,
+        maxAttempts: null
+      };
+    }
+    const initialDelayMs = reconnectOptions?.initialDelayMs ?? DEFAULT_RECONNECT_INITIAL_DELAY_MS;
+    const maxDelayMs = reconnectOptions?.maxDelayMs ?? DEFAULT_RECONNECT_MAX_DELAY_MS;
+    const factor = reconnectOptions?.factor ?? DEFAULT_RECONNECT_FACTOR;
+    const jitterRatio = reconnectOptions?.jitterRatio ?? DEFAULT_RECONNECT_JITTER_RATIO;
+    const maxAttempts = reconnectOptions?.maxAttempts ?? null;
+    if (!Number.isFinite(initialDelayMs) || initialDelayMs < 0) {
+      throw new Error("Client reconnect initialDelayMs must be a non-negative number.");
+    }
+    if (!Number.isFinite(maxDelayMs) || maxDelayMs < 0) {
+      throw new Error("Client reconnect maxDelayMs must be a non-negative number.");
+    }
+    if (maxDelayMs < initialDelayMs) {
+      throw new Error("Client reconnect maxDelayMs must be greater than or equal to initialDelayMs.");
+    }
+    if (!Number.isFinite(factor) || factor < 1) {
+      throw new Error("Client reconnect factor must be greater than or equal to 1.");
+    }
+    if (!Number.isFinite(jitterRatio) || jitterRatio < 0 || jitterRatio > 1) {
+      throw new Error("Client reconnect jitterRatio must be between 0 and 1.");
+    }
+    if (maxAttempts !== null && (!Number.isInteger(maxAttempts) || maxAttempts < 0)) {
+      throw new Error("Client reconnect maxAttempts must be a non-negative integer or null.");
+    }
+    return {
+      enabled: reconnectOptions?.enabled ?? true,
+      initialDelayMs,
+      maxDelayMs,
+      factor,
+      jitterRatio,
+      maxAttempts
+    };
+  }
+  scheduleReconnect() {
+    if (!this.reconnectConfig.enabled || this.reconnectTimer) {
+      return;
+    }
+    if (this.reconnectConfig.maxAttempts !== null && this.reconnectAttemptCount >= this.reconnectConfig.maxAttempts) {
+      return;
+    }
+    this.reconnectAttemptCount += 1;
+    const delayMs = this.computeReconnectDelay(this.reconnectAttemptCount);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, delayMs);
+    this.reconnectTimer.unref?.();
+  }
+  computeReconnectDelay(attemptNumber) {
+    const exponentialDelay = Math.min(
+      this.reconnectConfig.maxDelayMs,
+      this.reconnectConfig.initialDelayMs * Math.pow(this.reconnectConfig.factor, Math.max(0, attemptNumber - 1))
+    );
+    if (this.reconnectConfig.jitterRatio === 0 || exponentialDelay === 0) {
+      return Math.round(exponentialDelay);
+    }
+    const jitterDelta = exponentialDelay * this.reconnectConfig.jitterRatio;
+    const jitterOffset = (Math.random() * 2 - 1) * jitterDelta;
+    return Math.max(0, Math.round(exponentialDelay + jitterOffset));
+  }
+  clearReconnectTimer() {
+    if (!this.reconnectTimer) {
+      return;
+    }
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+  }
   createSocket() {
     if (this.options.protocols !== void 0) {
       return new WebSocket__default.default(this.url, this.options.protocols, this.options.wsOptions);
@@ -807,6 +992,8 @@ var SecureClient = class {
   }
   bindSocketEvents(socket) {
     socket.on("open", () => {
+      this.clearReconnectTimer();
+      this.reconnectAttemptCount = 0;
       this.sendInternalHandshake();
       this.notifyConnect();
     });
@@ -875,6 +1062,10 @@ var SecureClient = class {
           );
         }
       }
+      if (!this.isManualDisconnectRequested) {
+        this.scheduleReconnect();
+      }
+      this.isManualDisconnectRequested = false;
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to handle client disconnect."));
     }
