@@ -1,7 +1,7 @@
 {
-  "name": "@aegis-fluxion/core",
-  "version": "0.7.2",
-  "description": "Core WebSocket primitives for aegis-fluxion.",
+  "name": "@aegis-fluxion/redis-adapter",
+  "version": "0.1.0",
+  "description": "Redis Pub/Sub adapter for horizontally scaled SecureServer instances.",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -31,15 +31,23 @@
     "prepublishOnly": "npm run clean && npm run build && npm run typecheck && npm run test"
   },
   "dependencies": {
-    "ws": "^8.18.1"
+    "@aegis-fluxion/core": "^0.7.2",
+    "redis": "^5.8.2"
   },
   "devDependencies": {
-    "@types/ws": "^8.5.13",
     "tsup": "^8.3.5",
     "typescript": "^5.8.3",
     "vitest": "^3.2.4"
   },
   "engines": {
     "node": ">=18.18.0"
-  }
+  },
+  "keywords": [
+    "redis",
+    "pubsub",
+    "horizontal-scaling",
+    "websocket",
+    "secure-messaging"
+  ],
+  "license": "MIT"
 }

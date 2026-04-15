@@ -7,6 +7,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-04-15
+
+### Added
+
+- New package `@aegis-fluxion/redis-adapter@0.1.0` for horizontal scaling with Redis Pub/Sub.
+- `RedisSecureServerAdapter` now replicates cluster-wide encrypted events between server instances:
+  - global broadcasts (`server.emit(...)`)
+  - room broadcasts (`server.to(room).emit(...)`)
+- New core adapter contracts and helpers:
+  - `SecureServerAdapter`
+  - `SecureServerAdapterMessage`
+  - `normalizeSecureServerAdapterMessage(...)`
+
+### Changed
+
+- `@aegis-fluxion/core` bumped from `0.7.1` to `0.7.2`.
+- `SecureServer` now supports horizontal-scaling hooks:
+  - `adapter` option in constructor
+  - `setAdapter(...)`
+  - `handleAdapterMessage(...)`
+  - `serverId` getter for origin-aware replication
+- Umbrella package `aegis-fluxion` patch-bumped from `0.7.1` to `0.7.2` and now re-exports `@aegis-fluxion/redis-adapter`.
+- Monorepo scripts (`build`, `typecheck`, `test`, `clean`, `release:all`) now include `@aegis-fluxion/redis-adapter`.
+
+### Security
+
+- Redis replication payloads are normalized and validated before being applied on receiving nodes.
+- Adapter messages include `originServerId` and version metadata to avoid self-loop replay and schema drift.
+
 ## [0.7.1] - 2026-04-15
 
 ### Added

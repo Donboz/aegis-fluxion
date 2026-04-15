@@ -2,7 +2,12 @@ import { randomBytes } from "node:crypto";
 import { createServer } from "node:net";
 import WebSocket from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SecureClient, SecureServer } from "../src/index";
+import {
+  SecureClient,
+  SecureServer,
+  type SecureServerAdapter,
+  type SecureServerAdapterMessage
+} from "../src/index";
 
 const TEST_TIMEOUT_MS = 6000;
 
@@ -68,6 +73,36 @@ function createTamperedPacket(): Buffer {
   const forgedCiphertext = randomBytes(32);
 
   return Buffer.concat([packetVersion, iv, authTag, forgedCiphertext]);
+}
+
+class InMemorySecureServerAdapter implements SecureServerAdapter {
+  private static readonly adapters = new Set<InMemorySecureServerAdapter>();
+
+  private server: SecureServer | null = null;
+
+  public async attach(server: SecureServer): Promise<void> {
+    this.server = server;
+    InMemorySecureServerAdapter.adapters.add(this);
+  }
+
+  public async publish(message: SecureServerAdapterMessage): Promise<void> {
+    const peerAdapters = [...InMemorySecureServerAdapter.adapters].filter(
+      (adapter) => adapter !== this && adapter.server !== null
+    );
+
+    for (const adapter of peerAdapters) {
+      await adapter.server?.handleAdapterMessage(message);
+    }
+  }
+
+  public async detach(server: SecureServer): Promise<void> {
+    if (this.server !== server) {
+      return;
+    }
+
+    this.server = null;
+    InMemorySecureServerAdapter.adapters.delete(this);
+  }
 }
 
 describe("SecureServer and SecureClient encryption flow", () => {
@@ -355,6 +390,150 @@ describe("SecureServer and SecureClient encryption flow", () => {
       clientA.disconnect();
       clientB.disconnect();
       server.close();
+      await wait(30);
+    }
+  });
+
+  it("replicates broadcast and room events across server instances via adapter hooks", async () => {
+    const portA = await getFreePort();
+    const portB = await getFreePort();
+
+    const adapterA = new InMemorySecureServerAdapter();
+    const adapterB = new InMemorySecureServerAdapter();
+
+    const serverA = new SecureServer({
+      port: portA,
+      host: "127.0.0.1",
+      adapter: adapterA
+    });
+
+    const serverB = new SecureServer({
+      port: portB,
+      host: "127.0.0.1",
+      adapter: adapterB
+    });
+
+    const clientA = new SecureClient(`ws://127.0.0.1:${portA}`, {
+      reconnect: false
+    });
+
+    const clientB = new SecureClient(`ws://127.0.0.1:${portB}`, {
+      reconnect: false
+    });
+
+    try {
+      const serverReadyA = withTimeout(
+        new Promise<string>((resolve) => {
+          serverA.on("ready", (client) => {
+            resolve(client.id);
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "server A ready for adapter replication"
+      );
+
+      const serverReadyB = withTimeout(
+        new Promise<string>((resolve) => {
+          serverB.on("ready", (client) => {
+            resolve(client.id);
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "server B ready for adapter replication"
+      );
+
+      const clientReadyA = withTimeout(
+        new Promise<void>((resolve) => {
+          clientA.on("ready", () => {
+            resolve();
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "client A ready for adapter replication"
+      );
+
+      const clientReadyB = withTimeout(
+        new Promise<void>((resolve) => {
+          clientB.on("ready", () => {
+            resolve();
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "client B ready for adapter replication"
+      );
+
+      const [, serverBClientId] = await Promise.all([
+        serverReadyA,
+        serverReadyB,
+        clientReadyA,
+        clientReadyB
+      ]);
+
+      const serverBClient = serverB.clients.get(serverBClientId);
+
+      if (!serverBClient) {
+        throw new Error("Failed to resolve server B client for adapter room join.");
+      }
+
+      expect(serverBClient.join("cluster:ops")).toBe(true);
+
+      const replicatedBroadcastPayload = withTimeout(
+        new Promise<unknown>((resolve) => {
+          clientB.on("cluster:broadcast", (payload) => {
+            resolve(payload);
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "replicated broadcast payload"
+      );
+
+      expect(
+        serverA.emit("cluster:broadcast", {
+          source: "server-a",
+          kind: "broadcast"
+        })
+      ).toBe(serverA);
+
+      expect(await replicatedBroadcastPayload).toEqual({
+        source: "server-a",
+        kind: "broadcast"
+      });
+
+      let didClientAReceiveRoomEvent = false;
+
+      clientA.on("cluster:room", () => {
+        didClientAReceiveRoomEvent = true;
+      });
+
+      const replicatedRoomPayload = withTimeout(
+        new Promise<unknown>((resolve) => {
+          clientB.on("cluster:room", (payload) => {
+            resolve(payload);
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "replicated room payload"
+      );
+
+      serverA.to("cluster:ops").emit("cluster:room", {
+        source: "server-a",
+        kind: "room"
+      });
+
+      expect(await replicatedRoomPayload).toEqual({
+        source: "server-a",
+        kind: "room"
+      });
+
+      await wait(80);
+      expect(didClientAReceiveRoomEvent).toBe(false);
+    } finally {
+      await adapterA.detach(serverA);
+      await adapterB.detach(serverB);
+      clientA.disconnect();
+      clientB.disconnect();
+      serverA.close();
+      serverB.close();
       await wait(30);
     }
   });

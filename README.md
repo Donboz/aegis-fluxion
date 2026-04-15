@@ -1,16 +1,15 @@
 # aegis-fluxion
 
-![Version](https://img.shields.io/badge/version-0.7.1-2563eb)
+![Version](https://img.shields.io/badge/version-0.7.2-2563eb)
 ![Node](https://img.shields.io/badge/node-%3E%3D18.18.0-16a34a)
 ![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178c6)
 ![Crypto](https://img.shields.io/badge/Crypto-ECDH%20%2B%20AES--256--GCM-0f172a)
 
 `aegis-fluxion` is an end-to-end encrypted WebSocket toolkit for Node.js and TypeScript.
 
-It provides a secure event channel with ephemeral ECDH key exchange, AES-256-GCM encryption,
-encrypted ACK request/response, native binary payload support for `Buffer`, `Uint8Array`, and
-`Blob`, plus a phase-based middleware pipeline for connection policy, authentication, payload
-transformation, and MCP (Model Context Protocol) transport adaptation.
+It provides secure event transport with ephemeral ECDH key exchange, AES-256-GCM envelopes,
+ACK request/response semantics, binary payload support, middleware-based policy controls,
+and horizontal scaling through Redis Pub/Sub adapters.
 
 ---
 
@@ -18,41 +17,39 @@ transformation, and MCP (Model Context Protocol) transport adaptation.
 
 | Package | Purpose |
 | --- | --- |
-| `aegis-fluxion` | Main end-user package (recommended) |
-| `@aegis-fluxion/core` | Low-level primitives and transport internals |
-| `@aegis-fluxion/mcp-adapter` | MCP JSON-RPC transport over encrypted WebSocket tunnels |
+| `aegis-fluxion` | Umbrella package (recommended app-facing import) |
+| `@aegis-fluxion/core` | Secure transport primitives (`SecureServer`, `SecureClient`) |
+| `@aegis-fluxion/mcp-adapter` | MCP JSON-RPC transport over encrypted channels |
+| `@aegis-fluxion/redis-adapter` | Horizontal scaling adapter for cluster fanout |
 
 ---
 
-## What's New in 0.7.1
+## What's new in 0.7.2
 
-- `SecureServer` now includes a configurable **Rate Limiting & DDoS Protection** shield.
-- Burst control can be applied per connection and per source IP before custom handlers run.
-- Overload policy supports both **throttling** and **disconnect** actions with configurable thresholds.
-- Added integration tests for flood handling, throttle windows, and forced disconnect enforcement.
-
-### Prior 0.7.0 highlights
-
-- New `@aegis-fluxion/mcp-adapter` package
-- `SecureMCPTransport` to carry MCP JSON-RPC traffic over encrypted channels
-- Client and server transport modes for one secure MCP session per authenticated socket
-- Umbrella package now re-exports MCP adapter APIs out of the box
-- Existing middleware, binary, ACK, and reconnect features continue unchanged
+- Added **horizontal scaling support** with `@aegis-fluxion/redis-adapter`.
+- `SecureServer` now supports adapter hooks for cross-instance replication:
+  - constructor `adapter` option
+  - `setAdapter(...)`
+  - `handleAdapterMessage(...)`
+  - `serverId` getter for origin-aware relay filtering
+- Cluster replication now supports:
+  - global broadcasts (`server.emit(...)`)
+  - room broadcasts (`server.to(room).emit(...)`)
 
 ---
 
 ## Install
 
 ```bash
-npm install aegis-fluxion ws
+npm install aegis-fluxion ws redis
 ```
 
 ---
 
-## Quick Start (Middleware Auth + ACK)
+## Quick start
 
 ```ts
-import { SecureServer, SecureClient } from "aegis-fluxion";
+import { SecureClient, SecureServer } from "aegis-fluxion";
 
 const server = new SecureServer({ host: "127.0.0.1", port: 8080 });
 
@@ -65,41 +62,16 @@ server.use(async (context, next) => {
       throw new Error("Unauthorized");
     }
 
-    context.metadata.set("userId", "demo-user");
+    context.metadata.set("tenant", "acme");
   }
 
   await next();
-});
-
-server.use(async (context, next) => {
-  if (
-    context.phase === "incoming" &&
-    context.event === "notes:create" &&
-    typeof context.data === "object" &&
-    context.data !== null
-  ) {
-    const input = context.data as { note?: string };
-    context.data = {
-      note: String(input.note ?? "").trim()
-    };
-  }
-
-  await next();
-
-  if (context.phase === "outgoing" && context.event === "notes:create") {
-    context.data = {
-      ...(context.data as Record<string, unknown>),
-      handledAt: new Date().toISOString()
-    };
-  }
 });
 
 server.on("notes:create", async (payload, client) => {
-  const userId = client.metadata.get("userId");
-
   return {
     ok: true,
-    userId,
+    tenant: client.metadata.get("tenant"),
     payload
   };
 });
@@ -115,8 +87,8 @@ const client = new SecureClient("ws://127.0.0.1:8080", {
 client.on("ready", async () => {
   const result = await client.emit(
     "notes:create",
-    { note: "  hello secure world  " },
-    { timeoutMs: 2000 }
+    { note: "hello secure world" },
+    { timeoutMs: 1500 }
   );
 
   console.log(result);
@@ -125,121 +97,65 @@ client.on("ready", async () => {
 
 ---
 
-## MCP Integration over Encrypted WebSocket Transport
-
-`SecureMCPTransport` enables MCP-compatible JSON-RPC communication without stdio/SSE, fully
-inside your encrypted `SecureClient`/`SecureServer` tunnel.
+## Horizontal scaling with Redis
 
 ```ts
 import {
-  SecureClient,
-  SecureMCPTransport,
-  SecureServer,
-  type SecureMCPMessage
+  RedisSecureServerAdapter,
+  SecureServer
 } from "aegis-fluxion";
 
-const secureServer = new SecureServer({ host: "127.0.0.1", port: 9090 });
+const redisUrl = "redis://127.0.0.1:6379";
+const channel = "aegis-fluxion:cluster:prod";
 
-secureServer.use(async (context, next) => {
-  if (context.phase === "connection") {
-    const rawToken = context.request.headers.authorization;
-    const token = Array.isArray(rawToken) ? rawToken[0] : rawToken;
-
-    if (token !== "Bearer mcp-dev-token") {
-      throw new Error("Unauthorized MCP peer");
-    }
-  }
-
-  await next();
+const serverA = new SecureServer({
+  host: "127.0.0.1",
+  port: 8081,
+  adapter: new RedisSecureServerAdapter({ redisUrl, channel })
 });
 
-secureServer.on("connection", async (client) => {
-  const serverTransport = new SecureMCPTransport({
-    mode: "server",
-    server: secureServer,
-    clientId: client.id
-  });
-
-  serverTransport.onmessage = async (message: SecureMCPMessage) => {
-    // Forward message to your MCP server runtime.
-    console.log("Server-side MCP message:", message);
-  };
-
-  await serverTransport.start();
+const serverB = new SecureServer({
+  host: "127.0.0.1",
+  port: 8082,
+  adapter: new RedisSecureServerAdapter({ redisUrl, channel })
 });
 
-const secureClient = new SecureClient("ws://127.0.0.1:9090", {
-  wsOptions: {
-    headers: {
-      authorization: "Bearer mcp-dev-token"
-    }
-  }
-});
+serverA.on("connection", (client) => client.join("ops"));
+serverB.on("connection", (client) => client.join("ops"));
 
-const clientTransport = new SecureMCPTransport({
-  mode: "client",
-  client: secureClient
-});
-
-clientTransport.onmessage = async (message: SecureMCPMessage) => {
-  console.log("Client-side MCP message:", message);
-};
-
-await clientTransport.start();
-await clientTransport.send({
-  jsonrpc: "2.0",
-  id: 1,
-  method: "tools/list",
-  params: {}
+// Reaches room subscribers on BOTH instances.
+serverA.to("ops").emit("ops:alert", {
+  from: "server-a",
+  message: "Cluster-wide event"
 });
 ```
 
 ---
 
-## Middleware Execution Model
+## Security and reliability capabilities
 
-- `connection` phase runs before the connection is accepted by application handlers
-- `incoming` phase runs before custom event handlers receive decrypted payloads
-- `outgoing` phase runs before encrypted payloads are sent to client(s)
-- Throwing in middleware rejects processing (for `connection`, the socket is closed with code `1008`)
-- `metadata` is a mutable `Map<string, unknown>` in middleware and read-only in `SecureServerClient`
-
----
-
-## Binary Payload Behavior
-
-- `Buffer` arrives as `Buffer`
-- `Uint8Array` arrives as `Uint8Array`
-- `Blob` arrives as `Blob` (falls back to `Buffer` if `Blob` is unavailable in runtime)
-- Binary values can be nested inside regular JSON objects/arrays
+- Ephemeral ECDH handshake (`prime256v1`)
+- AES-256-GCM authenticated encryption for all application payloads
+- Binary payload support (`Buffer`, `Uint8Array`, `Blob`)
+- ACK request/response with timeout controls
+- Rate limiting and DDoS controls (per connection + per IP)
+- Heartbeat zombie cleanup and reconnect backoff handling
 
 ---
 
-## Security Model
+## MCP transport
 
-- Ephemeral ECDH (`prime256v1`) derives per-session secrets
-- AES-256-GCM encrypts all application payloads (JSON and binary)
-- GCM authentication tag enforces tamper detection and integrity
-- Internal transport events are reserved and blocked from manual emit
+`aegis-fluxion` also re-exports MCP transport helpers:
 
----
+```ts
+import { SecureMCPTransport } from "aegis-fluxion";
+```
 
-## Reliability Features
-
-- Heartbeat Ping/Pong stale-connection cleanup
-- Client auto-reconnect with exponential backoff and jitter
-- Fresh re-handshake and key derivation after reconnect
-- Promise and callback ACK APIs with per-request timeouts
+See package docs: [`packages/mcp-adapter/README.md`](./packages/mcp-adapter/README.md)
 
 ---
 
-## Changelog
-
-See [`CHANGELOG.md`](./CHANGELOG.md) for complete release history.
-
----
-
-## Monorepo Development
+## Development
 
 From repository root:
 
@@ -249,6 +165,12 @@ npm run typecheck
 npm run test
 npm run build
 ```
+
+---
+
+## Changelog
+
+Full release history is documented in [`CHANGELOG.md`](./CHANGELOG.md).
 
 ---
 

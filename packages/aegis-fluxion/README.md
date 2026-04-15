@@ -1,186 +1,94 @@
 # aegis-fluxion
 
-Main end-user package for the `aegis-fluxion` secure messaging toolkit.
+Main end-user package for the `aegis-fluxion` secure messaging ecosystem.
 
-This package re-exports the full public API from `@aegis-fluxion/core`, including
-`SecureServer`, `SecureClient`, and all related types.
-
-Version: **0.7.1**
+Version: **0.7.2**
 
 ---
 
-## Installation
+## Re-exported modules
+
+`aegis-fluxion` re-exports all public APIs from:
+
+- `@aegis-fluxion/core`
+- `@aegis-fluxion/mcp-adapter`
+- `@aegis-fluxion/redis-adapter`
+
+This means you can build encrypted transport, MCP bridges, and Redis-based horizontal scaling
+without multiple package-level imports.
+
+---
+
+## Install
 
 ```bash
-npm install aegis-fluxion ws
+npm install aegis-fluxion ws redis
 ```
 
 ---
 
-## Why `aegis-fluxion`
-
-- ECDH + AES-256-GCM encrypted transport
-- Encrypted ACK request/response with timeout control
-- Room-based secure fanout
-- Heartbeat cleanup + reconnect resilience
-- **Binary support out of the box** (`Buffer`, `Uint8Array`, `Blob`)
-- **Middleware auth and policy hooks** (`connection` / `incoming` / `outgoing`)
-- Per-client metadata pipeline via `client.metadata`
-- **Rate limiting and DDoS shield** (per-connection + per-IP)
-- **MCP transport adapter** (`SecureMCPTransport`) for JSON-RPC over encrypted WebSocket
-
----
-
-## Quick Start (Middleware + ACK)
+## Quick start
 
 ```ts
 import { SecureClient, SecureServer } from "aegis-fluxion";
 
 const server = new SecureServer({ host: "127.0.0.1", port: 8080 });
 
-server.use(async (context, next) => {
-  if (context.phase === "connection") {
-    const rawApiKey = context.request.headers["x-api-key"];
-    const apiKey = Array.isArray(rawApiKey) ? rawApiKey[0] : rawApiKey;
-
-    if (apiKey !== "dev-secret") {
-      throw new Error("Unauthorized");
-    }
-
-    context.metadata.set("tenant", "acme");
-  }
-
-  await next();
-});
-
-server.use(async (context, next) => {
-  if (
-    context.phase === "incoming" &&
-    context.event === "file:upload" &&
-    typeof context.data === "object" &&
-    context.data !== null
-  ) {
-    const payload = context.data as { name?: string; chunk?: Uint8Array; previewBlob?: Blob };
-    context.data = {
-      name: String(payload.name ?? "").trim(),
-      chunk: payload.chunk,
-      previewBlob: payload.previewBlob
-    };
-  }
-
-  await next();
-});
-
-server.on("file:upload", async (payload) => {
-  const { name, chunk, previewBlob } = payload as { name: string; chunk: Uint8Array; previewBlob: Blob };
-
+server.on("tasks:create", async (payload) => {
   return {
-    name,
-    chunkBytes: chunk.byteLength,
-    previewBytes: previewBlob.size,
-    accepted: true
+    ok: true,
+    payload
   };
 });
 
-const client = new SecureClient("ws://127.0.0.1:8080", {
-  wsOptions: {
-    headers: {
-      "x-api-key": "dev-secret"
-    }
-  }
-});
+const client = new SecureClient("ws://127.0.0.1:8080");
 
 client.on("ready", async () => {
-  const response = await client.emit(
-    "file:upload",
-    {
-      name: "avatar.png",
-      chunk: Uint8Array.from([137, 80, 78, 71]),
-      previewBlob: new Blob([Buffer.from("tiny-preview")], {
-        type: "image/png"
-      })
-    },
-    { timeoutMs: 2000 }
-  );
-
+  const response = await client.emit("tasks:create", { id: "t-1" }, { timeoutMs: 1200 });
   console.log(response);
 });
 ```
 
 ---
 
-## Middleware Notes
-
-- `connection` middleware runs before the app accepts the socket.
-- Unauthorized sockets are closed with policy code `1008`.
-- `incoming` and `outgoing` middleware can transform event names/payloads.
-- Metadata set during middleware is available later through `client.metadata`.
-
----
-
-## Rate Limiting & DDoS Shield
-
-The umbrella package includes `SecureServer` rate limiting controls from `@aegis-fluxion/core`.
+## Horizontal scaling example (Redis adapter)
 
 ```ts
-import { SecureServer } from "aegis-fluxion";
+import {
+  RedisSecureServerAdapter,
+  SecureServer
+} from "aegis-fluxion";
 
-const server = new SecureServer({
+const redisUrl = "redis://127.0.0.1:6379";
+const channel = "aegis-fluxion:cluster:prod";
+
+const adapterA = new RedisSecureServerAdapter({ redisUrl, channel });
+const adapterB = new RedisSecureServerAdapter({ redisUrl, channel });
+
+const serverA = new SecureServer({
   host: "127.0.0.1",
-  port: 8080,
-  rateLimit: {
-    enabled: true,
-    windowMs: 1_000,
-    maxEventsPerConnection: 120,
-    maxEventsPerIp: 300,
-    action: "throttle", // or "disconnect"
-    throttleMs: 150,
-    maxThrottleMs: 2_000,
-    disconnectAfterViolations: 4,
-    disconnectCode: 1013,
-    disconnectReason: "Rate limit exceeded. Please retry later."
-  }
+  port: 8081,
+  adapter: adapterA
+});
+
+const serverB = new SecureServer({
+  host: "127.0.0.1",
+  port: 8082,
+  adapter: adapterB
+});
+
+serverA.on("connection", (client) => client.join("alerts"));
+serverB.on("connection", (client) => client.join("alerts"));
+
+serverA.to("alerts").emit("alerts:new", {
+  level: "info",
+  source: "server-a"
 });
 ```
 
-Protection behavior:
-
-- Over-limit bursts are delayed and then selectively dropped during active throttle windows.
-- Persistent abuse can trigger server-side disconnect with configurable close code/reason.
-- Limits are evaluated per connection and per resolved source IP.
-
 ---
 
-## Callback-style ACK Example
-
-```ts
-client.emit(
-  "file:upload",
-  {
-    name: "report.bin",
-    chunk: Buffer.from("01020304", "hex"),
-    previewBlob: new Blob([Buffer.from("ok")], {
-      type: "application/octet-stream"
-    })
-  },
-  { timeoutMs: 2000 },
-  (error, response) => {
-    if (error) {
-      console.error(error.message);
-      return;
-    }
-
-    console.log(response);
-  }
-);
-```
-
----
-
-## MCP Adapter Quick Start
-
-`aegis-fluxion` re-exports `SecureMCPTransport`, so you can wire MCP-compatible traffic
-directly without importing separate packages.
+## MCP transport example
 
 ```ts
 import {
@@ -193,50 +101,43 @@ import {
 const secureServer = new SecureServer({ host: "127.0.0.1", port: 9092 });
 
 secureServer.on("connection", async (client) => {
-  const transport = new SecureMCPTransport({
+  const serverTransport = new SecureMCPTransport({
     mode: "server",
     server: secureServer,
     clientId: client.id
   });
 
-  transport.onmessage = async (message: SecureMCPMessage) => {
+  serverTransport.onmessage = async (message: SecureMCPMessage) => {
     console.log("Server MCP message", message);
   };
 
-  await transport.start();
+  await serverTransport.start();
 });
 
 const secureClient = new SecureClient("ws://127.0.0.1:9092");
 
-const transport = new SecureMCPTransport({
+const clientTransport = new SecureMCPTransport({
   mode: "client",
   client: secureClient
 });
 
-await transport.start();
-await transport.send({
+await clientTransport.start();
+await clientTransport.send({
   jsonrpc: "2.0",
   id: 1,
-  method: "resources/list",
+  method: "tools/list",
   params: {}
 });
 ```
 
 ---
 
-## Binary Payload Notes
+## Related documentation
 
-- Binary integrity is protected by AES-GCM authentication tags.
-- Payload type is preserved across encrypted transport.
-- Mixed payloads (JSON + binary) are supported.
-
----
-
-## Related Docs
-
-- Core package docs: [`../core/README.md`](../core/README.md)
-- MCP adapter docs: [`../mcp-adapter/README.md`](../mcp-adapter/README.md)
-- Repository changelog: [`../../CHANGELOG.md`](../../CHANGELOG.md)
+- Core: [`../core/README.md`](../core/README.md)
+- Redis adapter: [`../redis-adapter/README.md`](../redis-adapter/README.md)
+- MCP adapter: [`../mcp-adapter/README.md`](../mcp-adapter/README.md)
+- Changelog: [`../../CHANGELOG.md`](../../CHANGELOG.md)
 
 ---
 

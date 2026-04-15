@@ -1,6 +1,7 @@
 import { IncomingMessage } from 'node:http';
 import WebSocket, { ClientOptions, ServerOptions } from 'ws';
 
+declare const SECURE_SERVER_ADAPTER_MESSAGE_VERSION = 1;
 interface SecureEnvelope<TData = unknown> {
     event: string;
     data: TData;
@@ -28,9 +29,25 @@ interface SecureServerRateLimitOptions {
     disconnectCode?: number;
     disconnectReason?: string;
 }
+type SecureServerAdapterMessageScope = "broadcast" | "room";
+interface SecureServerAdapterMessage {
+    version: typeof SECURE_SERVER_ADAPTER_MESSAGE_VERSION;
+    originServerId: string;
+    scope: SecureServerAdapterMessageScope;
+    event: string;
+    data: unknown;
+    emittedAt: number;
+    room?: string;
+}
+interface SecureServerAdapter {
+    attach: (server: SecureServer) => void | Promise<void>;
+    publish: (message: SecureServerAdapterMessage) => void | Promise<void>;
+    detach?: (server: SecureServer) => void | Promise<void>;
+}
 interface SecureServerOptions extends ServerOptions {
     heartbeat?: SecureServerHeartbeatOptions;
     rateLimit?: SecureServerRateLimitOptions;
+    adapter?: SecureServerAdapter;
 }
 interface SecureClientReconnectOptions {
     enabled?: boolean;
@@ -98,8 +115,11 @@ interface SecureServerMessageMiddlewareContext {
 type SecureServerMiddlewareContext = SecureServerConnectionMiddlewareContext | SecureServerMessageMiddlewareContext;
 type SecureServerMiddlewareNext = () => Promise<void>;
 type SecureServerMiddleware = (context: SecureServerMiddlewareContext, next: SecureServerMiddlewareNext) => void | Promise<void>;
+declare function normalizeSecureServerAdapterMessage(value: unknown): SecureServerAdapterMessage;
 declare class SecureServer {
+    private readonly instanceId;
     private readonly socketServer;
+    private adapter;
     private readonly heartbeatConfig;
     private readonly rateLimitConfig;
     private heartbeatIntervalHandle;
@@ -125,7 +145,10 @@ declare class SecureServer {
     private readonly rateLimitBucketsByIp;
     constructor(options: SecureServerOptions);
     get clientCount(): number;
+    get serverId(): string;
     get clients(): ReadonlyMap<string, SecureServerClient>;
+    setAdapter(adapter: SecureServerAdapter | null): Promise<void>;
+    handleAdapterMessage(message: unknown): Promise<void>;
     on(event: "connection", handler: SecureServerConnectionHandler): this;
     on(event: "disconnect", handler: SecureServerDisconnectHandler): this;
     on(event: "ready", handler: SecureServerReadyHandler): this;
@@ -185,6 +208,8 @@ declare class SecureServer {
     private queuePayload;
     private flushQueuedPayloads;
     private createSecureServerClient;
+    private emitLocally;
+    private publishAdapterMessage;
     private normalizeRoomName;
     private joinClientToRoom;
     private leaveClientFromRoom;
@@ -251,4 +276,4 @@ declare class SecureClient {
     private flushPendingPayloadQueue;
 }
 
-export { type SecureAckCallback, type SecureAckOptions, type SecureBinaryPayload, SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureClientReconnectOptions, type SecureEnvelope, type SecureErrorHandler, SecureServer, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerConnectionMiddlewareContext, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerHeartbeatOptions, type SecureServerLifecycleEvent, type SecureServerMessageMiddlewareContext, type SecureServerMiddleware, type SecureServerMiddlewareContext, type SecureServerMiddlewareNext, type SecureServerOptions, type SecureServerRateLimitAction, type SecureServerRateLimitOptions, type SecureServerReadyHandler, type SecureServerRoomOperator };
+export { type SecureAckCallback, type SecureAckOptions, type SecureBinaryPayload, SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureClientReconnectOptions, type SecureEnvelope, type SecureErrorHandler, SecureServer, type SecureServerAdapter, type SecureServerAdapterMessage, type SecureServerAdapterMessageScope, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerConnectionMiddlewareContext, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerHeartbeatOptions, type SecureServerLifecycleEvent, type SecureServerMessageMiddlewareContext, type SecureServerMiddleware, type SecureServerMiddlewareContext, type SecureServerMiddlewareNext, type SecureServerOptions, type SecureServerRateLimitAction, type SecureServerRateLimitOptions, type SecureServerReadyHandler, type SecureServerRoomOperator, normalizeSecureServerAdapterMessage };

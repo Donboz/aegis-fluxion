@@ -34,6 +34,51 @@ var DEFAULT_RATE_LIMIT_MAX_THROTTLE_MS = 2e3;
 var DEFAULT_RATE_LIMIT_DISCONNECT_AFTER_VIOLATIONS = 4;
 var DEFAULT_RATE_LIMIT_CLOSE_CODE = 1013;
 var DEFAULT_RATE_LIMIT_CLOSE_REASON = "Rate limit exceeded. Please retry later.";
+var SECURE_SERVER_ADAPTER_MESSAGE_VERSION = 1;
+function normalizeSecureServerAdapterMessage(value) {
+  if (!isPlainObject(value)) {
+    throw new Error("SecureServer adapter message must be a plain object.");
+  }
+  if (value.version !== SECURE_SERVER_ADAPTER_MESSAGE_VERSION) {
+    throw new Error(
+      `Unsupported SecureServer adapter message version: ${String(value.version)}.`
+    );
+  }
+  if (typeof value.originServerId !== "string" || value.originServerId.trim().length === 0) {
+    throw new Error("SecureServer adapter message originServerId must be a non-empty string.");
+  }
+  if (value.scope !== "broadcast" && value.scope !== "room") {
+    throw new Error('SecureServer adapter message scope must be either "broadcast" or "room".');
+  }
+  if (typeof value.event !== "string" || value.event.trim().length === 0) {
+    throw new Error("SecureServer adapter message event must be a non-empty string.");
+  }
+  if (typeof value.emittedAt !== "number" || !Number.isFinite(value.emittedAt)) {
+    throw new Error("SecureServer adapter message emittedAt must be a finite number.");
+  }
+  if (value.scope === "room") {
+    if (typeof value.room !== "string" || value.room.trim().length === 0) {
+      throw new Error("SecureServer adapter message room must be a non-empty string.");
+    }
+    return {
+      version: SECURE_SERVER_ADAPTER_MESSAGE_VERSION,
+      originServerId: value.originServerId,
+      scope: value.scope,
+      event: value.event,
+      data: value.data,
+      emittedAt: value.emittedAt,
+      room: value.room.trim()
+    };
+  }
+  return {
+    version: SECURE_SERVER_ADAPTER_MESSAGE_VERSION,
+    originServerId: value.originServerId,
+    scope: value.scope,
+    event: value.event,
+    data: value.data,
+    emittedAt: value.emittedAt
+  };
+}
 function normalizeToError(error, fallbackMessage) {
   if (error instanceof Error) {
     return error;
@@ -362,7 +407,9 @@ function decryptSerializedEnvelope(rawData, encryptionKey) {
   return plaintext.toString("utf8");
 }
 var SecureServer = class {
+  instanceId = randomUUID();
   socketServer;
+  adapter = null;
   heartbeatConfig;
   rateLimitConfig;
   heartbeatIntervalHandle = null;
@@ -387,18 +434,75 @@ var SecureServer = class {
   rateLimitBucketsByClientId = /* @__PURE__ */ new Map();
   rateLimitBucketsByIp = /* @__PURE__ */ new Map();
   constructor(options) {
-    const { heartbeat, rateLimit, ...socketServerOptions } = options;
+    const { heartbeat, rateLimit, adapter, ...socketServerOptions } = options;
     this.heartbeatConfig = this.resolveHeartbeatConfig(heartbeat);
     this.rateLimitConfig = this.resolveRateLimitConfig(rateLimit);
     this.socketServer = new WebSocketServer(socketServerOptions);
     this.bindSocketServerEvents();
     this.startHeartbeatLoop();
+    if (adapter) {
+      void this.setAdapter(adapter).catch(() => {
+        return void 0;
+      });
+    }
   }
   get clientCount() {
     return this.clientsById.size;
   }
+  get serverId() {
+    return this.instanceId;
+  }
   get clients() {
     return this.clientsById;
+  }
+  async setAdapter(adapter) {
+    const previousAdapter = this.adapter;
+    if (previousAdapter === adapter) {
+      return;
+    }
+    try {
+      if (previousAdapter?.detach) {
+        await Promise.resolve(previousAdapter.detach(this));
+      }
+      this.adapter = null;
+      if (!adapter) {
+        return;
+      }
+      await Promise.resolve(adapter.attach(this));
+      this.adapter = adapter;
+    } catch (error) {
+      const normalizedError = normalizeToError(
+        error,
+        "Failed to set SecureServer adapter."
+      );
+      this.notifyError(normalizedError);
+      throw normalizedError;
+    }
+  }
+  async handleAdapterMessage(message) {
+    try {
+      const normalizedMessage = normalizeSecureServerAdapterMessage(message);
+      if (normalizedMessage.originServerId === this.instanceId) {
+        return;
+      }
+      if (normalizedMessage.scope === "broadcast") {
+        this.emitLocally(normalizedMessage.event, normalizedMessage.data);
+        return;
+      }
+      if (!normalizedMessage.room) {
+        return;
+      }
+      this.emitToRoom(
+        normalizedMessage.room,
+        normalizedMessage.event,
+        normalizedMessage.data,
+        false
+      );
+    } catch (error) {
+      this.notifyError(
+        normalizeToError(error, "Failed to process SecureServer adapter message.")
+      );
+    }
   }
   on(event, handler) {
     try {
@@ -486,12 +590,12 @@ var SecureServer = class {
       if (isReservedEmitEvent(event)) {
         throw new Error(`The event "${event}" is reserved and cannot be emitted manually.`);
       }
-      const envelope = { event, data };
-      for (const client of this.clientsById.values()) {
-        void this.sendOrQueuePayload(client.socket, envelope).catch(() => {
-          return void 0;
-        });
-      }
+      this.emitLocally(event, data);
+      this.publishAdapterMessage({
+        scope: "broadcast",
+        event,
+        data
+      });
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to emit server event."));
     }
@@ -548,7 +652,7 @@ var SecureServer = class {
     return {
       emit: (event, data) => {
         try {
-          this.emitToRoom(normalizedRoom, event, data);
+          this.emitToRoom(normalizedRoom, event, data, true);
         } catch (error) {
           this.notifyError(
             normalizeToError(error, `Failed to emit event to room ${normalizedRoom}.`)
@@ -561,6 +665,15 @@ var SecureServer = class {
   close(code = DEFAULT_CLOSE_CODE, reason = DEFAULT_CLOSE_REASON) {
     try {
       this.stopHeartbeatLoop();
+      const activeAdapter = this.adapter;
+      this.adapter = null;
+      if (activeAdapter?.detach) {
+        void Promise.resolve(activeAdapter.detach(this)).catch((error) => {
+          this.notifyError(
+            normalizeToError(error, "Failed to detach SecureServer adapter during close.")
+          );
+        });
+      }
       for (const client of this.clientsById.values()) {
         this.rejectPendingRpcRequests(
           client.socket,
@@ -1429,6 +1542,48 @@ var SecureServer = class {
       leaveAll: () => this.leaveClientFromAllRooms(clientId)
     };
   }
+  emitLocally(event, data) {
+    const envelope = { event, data };
+    for (const client of this.clientsById.values()) {
+      void this.sendOrQueuePayload(client.socket, envelope).catch(() => {
+        return void 0;
+      });
+    }
+  }
+  publishAdapterMessage(message) {
+    if (!this.adapter) {
+      return;
+    }
+    let adapterMessage;
+    if (message.scope === "room") {
+      if (!message.room) {
+        return;
+      }
+      adapterMessage = {
+        version: SECURE_SERVER_ADAPTER_MESSAGE_VERSION,
+        originServerId: this.instanceId,
+        scope: "room",
+        event: message.event,
+        data: message.data,
+        emittedAt: Date.now(),
+        room: message.room
+      };
+    } else {
+      adapterMessage = {
+        version: SECURE_SERVER_ADAPTER_MESSAGE_VERSION,
+        originServerId: this.instanceId,
+        scope: "broadcast",
+        event: message.event,
+        data: message.data,
+        emittedAt: Date.now()
+      };
+    }
+    void Promise.resolve(this.adapter.publish(adapterMessage)).catch((error) => {
+      this.notifyError(
+        normalizeToError(error, "Failed to publish SecureServer adapter message.")
+      );
+    });
+  }
   normalizeRoomName(room) {
     if (typeof room !== "string") {
       throw new Error("Room name must be a string.");
@@ -1494,22 +1649,29 @@ var SecureServer = class {
     }
     return roomNames.length;
   }
-  emitToRoom(room, event, data) {
+  emitToRoom(room, event, data, replicate) {
     if (isReservedEmitEvent(event)) {
       throw new Error(`The event "${event}" is reserved and cannot be emitted manually.`);
     }
     const roomMembers = this.roomMembersByName.get(room);
-    if (!roomMembers || roomMembers.size === 0) {
-      return;
-    }
-    const envelope = { event, data };
-    for (const clientId of roomMembers) {
-      const client = this.clientsById.get(clientId);
-      if (!client) {
-        continue;
+    if (roomMembers && roomMembers.size > 0) {
+      const envelope = { event, data };
+      for (const clientId of roomMembers) {
+        const client = this.clientsById.get(clientId);
+        if (!client) {
+          continue;
+        }
+        void this.sendOrQueuePayload(client.socket, envelope).catch(() => {
+          return void 0;
+        });
       }
-      void this.sendOrQueuePayload(client.socket, envelope).catch(() => {
-        return void 0;
+    }
+    if (replicate) {
+      this.publishAdapterMessage({
+        scope: "room",
+        room,
+        event,
+        data
       });
     }
   }
@@ -2112,6 +2274,6 @@ var SecureClient = class {
   }
 };
 
-export { SecureClient, SecureServer };
+export { SecureClient, SecureServer, normalizeSecureServerAdapterMessage };
 //# sourceMappingURL=index.js.map
 //# sourceMappingURL=index.js.map
