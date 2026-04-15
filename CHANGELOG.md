@@ -1,0 +1,79 @@
+<!-- markdownlint-disable MD024 -->
+
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.4.0] - 2026-04-15
+
+### Added
+
+- Encrypted RPC-style ACK request/response flow over the existing AES-256-GCM tunnel.
+- Promise-based ACK API for `SecureClient.emit(...)` and server-side `emitTo(...)`.
+- Callback-based ACK API for Node-style interoperability.
+- Per-request ACK timeout controls to fail fast on missing responses.
+- New integration tests covering ACK success paths and timeout scenarios.
+
+### Changed
+
+- Extended server and client emit signatures to support optional ACK options and callbacks.
+- Improved event pipeline to route internal RPC request/response frames safely.
+
+### Security
+
+- ACK payloads remain fully encrypted in transit using the same E2E envelope.
+- Reserved internal RPC event names are protected against manual emit misuse.
+
+## [0.3.0] - 2026-04-15
+
+### Added
+
+- Heartbeat Ping/Pong lifecycle to detect stale connections.
+- Automatic reconnect with configurable exponential backoff and jitter.
+- Re-handshake flow after reconnect to derive fresh encryption keys.
+- Tests for zombie socket cleanup and reconnect resilience.
+
+### Changed
+
+- Client lifecycle now supports controlled reconnect attempts and delay policies.
+- Server cleanup now clears per-socket cryptographic/session state on timeout.
+
+### Security
+
+- Zombie connection cleanup reduces risk of stale session reuse.
+- Fresh key derivation after reconnect hardens long-running sessions.
+
+## [0.2.0] - 2026-04-15
+
+### Added
+
+- Secure room primitives: `join`, `leave`, `leaveAll`, and `to(room).emit(...)`.
+- Room membership tracking with server-side fanout routing.
+- Integration tests for encrypted room messaging behavior.
+
+### Changed
+
+- Server client abstraction expanded with room management helpers.
+
+### Security
+
+- Room fanout continues to use encrypted payload delivery only.
+- Room membership cleanup on disconnect prevents residual routing state.
+
+## [0.1.0] - 2026-04-15
+
+### Added
+
+- Initial `@aegis-fluxion/core` release.
+- Ephemeral ECDH handshake (`prime256v1`) for session key agreement.
+- AES-256-GCM encrypted message envelopes for application events.
+- Lifecycle events for connection, readiness, disconnection, and error handling.
+- Basic encrypted server-client event communication model.
+
+### Security
+
+- Authenticated encryption with AES-GCM tamper detection.
+- Shared secret derived per-session from ephemeral handshake keys.

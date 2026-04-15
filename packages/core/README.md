@@ -1,6 +1,8 @@
 # @aegis-fluxion/core
 
-Core E2E-encrypted WebSocket primitives for `aegis-fluxion`.
+Low-level E2E-encrypted WebSocket primitives for the `aegis-fluxion` ecosystem.
+
+If you want a single user-facing package, use [`aegis-fluxion`](../aegis-fluxion/README.md).
 
 Version: **0.4.0**
 
@@ -8,13 +10,13 @@ Version: **0.4.0**
 
 ## Features
 
-- ECDH handshake (`prime256v1`) with ephemeral key exchange
-- AES-256-GCM encrypted message envelopes
-- Server/client lifecycle events (`connect`, `ready`, `disconnect`, `error`)
-- Secure room routing (`join`, `leave`, `to(room).emit`)
-- Heartbeat-based zombie cleanup
-- Auto-reconnect with exponential backoff
-- **RPC-style ACK request/response with timeout support**
+- Ephemeral ECDH handshake (`prime256v1`)
+- AES-256-GCM encrypted application envelopes
+- Server/client lifecycle hooks (`connect`, `ready`, `disconnect`, `error`)
+- Secure room routing (`join`, `leave`, `leaveAll`, `to(room).emit`)
+- Heartbeat Ping/Pong zombie cleanup
+- Client auto-reconnect with exponential backoff
+- Encrypted RPC-style ACK request/response (Promise and callback)
 
 ---
 
@@ -26,7 +28,7 @@ npm install @aegis-fluxion/core ws
 
 ---
 
-## API at a Glance
+## API Snapshot
 
 ### `SecureServer`
 
@@ -44,10 +46,10 @@ npm install @aegis-fluxion/core ws
 
 - `id: string`
 - `socket: WebSocket`
+- `emit(event, data, ...ackArgs): boolean | Promise<unknown>`
 - `join(room): boolean`
 - `leave(room): boolean`
 - `leaveAll(): number`
-- `emit(event, data, ...ackArgs): boolean | Promise<unknown>`
 
 ### `SecureClient`
 
@@ -64,14 +66,14 @@ npm install @aegis-fluxion/core ws
 
 ---
 
-## ACK (Request-Response) Usage
+## ACK Request/Response Examples
 
-### 1) Client -> Server (Promise ACK)
+### Client -> Server (Promise)
 
 ```ts
 import { SecureClient, SecureServer } from "@aegis-fluxion/core";
 
-const server = new SecureServer({ port: 8080, host: "127.0.0.1" });
+const server = new SecureServer({ host: "127.0.0.1", port: 8080 });
 
 server.on("math:add", ({ a, b }) => {
   return { total: Number(a) + Number(b) };
@@ -90,7 +92,7 @@ client.on("ready", async () => {
 });
 ```
 
-### 2) Client -> Server (Callback ACK)
+### Client -> Server (Callback)
 
 ```ts
 client.emit(
@@ -99,7 +101,7 @@ client.emit(
   { timeoutMs: 1000 },
   (error, response) => {
     if (error) {
-      console.error("ACK error:", error.message);
+      console.error(error.message);
       return;
     }
 
@@ -108,7 +110,7 @@ client.emit(
 );
 ```
 
-### 3) Server -> Client (Promise ACK)
+### Server -> Client (Promise)
 
 ```ts
 server.on("ready", async (clientSocket) => {
@@ -120,41 +122,22 @@ server.on("ready", async (clientSocket) => {
 
   console.log(response);
 });
-
-client.on("agent:health", () => {
-  return { ok: true, uptime: process.uptime() };
-});
-```
-
-### 4) ACK Timeout Behavior
-
-When no response arrives before `timeoutMs`, ACK request fails:
-
-- Promise form -> rejects with timeout error
-- Callback form -> callback receives `Error`
-
-```ts
-try {
-  await client.emit("never:respond", { ping: true }, { timeoutMs: 300 });
-} catch (error) {
-  console.error((error as Error).message);
-  // ACK response timed out after 300ms for event "never:respond".
-}
 ```
 
 ---
 
 ## Security Notes
 
-- ACK request and ACK response frames are encrypted with the same AES-GCM tunnel as normal events.
-- Internal handshake/RPC transport events are reserved and cannot be emitted manually.
-- On disconnect/heartbeat timeout, pending ACK promises are rejected and memory state is cleaned.
+- ACK requests and responses use the same encrypted AES-GCM channel.
+- Internal handshake/RPC transport events are reserved.
+- Pending ACK requests are rejected on timeout/disconnect.
+- Tampered encrypted packets are dropped.
 
 ---
 
 ## Development
 
-From monorepo root:
+From repository root:
 
 ```bash
 npm run typecheck -w @aegis-fluxion/core
@@ -166,7 +149,7 @@ npm run build -w @aegis-fluxion/core
 
 ## Publish
 
-From monorepo root:
+From repository root:
 
 ```bash
 npm publish -w @aegis-fluxion/core --access public
