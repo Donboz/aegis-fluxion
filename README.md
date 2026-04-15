@@ -177,7 +177,7 @@ new SecureServer({
 });
 ```
 
-**Behavior**
+#### Heartbeat Behavior
 
 - Every `intervalMs`, the server sends Ping to open sockets.
 - If no Pong is received within `timeoutMs`, the socket is treated as zombie.
@@ -200,7 +200,7 @@ new SecureClient("ws://127.0.0.1:8080", {
 });
 ```
 
-**Behavior**
+#### Reconnect Behavior
 
 - Reconnect is triggered after unintentional disconnect.
 - Retry delay follows exponential backoff with optional jitter.
@@ -313,6 +313,31 @@ Project layout:
         ├── tsconfig.json
         └── tsup.config.ts
 ```
+
+---
+
+## Publishing to an npm Organization
+
+This monorepo publishes the core package under the organization scope:
+
+- `@aegis-fluxion/core`
+
+From repository root:
+
+```bash
+npm whoami
+npm run release:core
+```
+
+If you are not logged in yet:
+
+```bash
+npm login
+```
+
+After login, `npm run release:core` runs tests, builds the package, and publishes it as a public scoped package.
+
+> Tip: for CI/CD, prefer npm Trusted Publishing (OIDC) and provenance-enabled releases.
 
 ---
 

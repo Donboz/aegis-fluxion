@@ -11,7 +11,9 @@
     "dev": "npm run dev -w @aegis-fluxion/core",
     "typecheck": "npm run typecheck -w @aegis-fluxion/core",
     "test": "npm run test -w @aegis-fluxion/core",
-    "clean": "npm run clean -w @aegis-fluxion/core"
+    "clean": "npm run clean -w @aegis-fluxion/core",
+    "publish:core": "npm publish -w @aegis-fluxion/core --access public",
+    "release:core": "npm run test && npm run build && npm run publish:core"
   },
   "engines": {
     "node": ">=18.18.0"
