@@ -1,7 +1,7 @@
 {
-  "name": "aegis-fluxion",
+  "name": "@aegis-fluxion/mcp-adapter",
   "version": "0.7.0",
-  "description": "Umbrella package for the aegis-fluxion E2E encrypted WebSocket toolkit.",
+  "description": "MCP transport adapter over aegis-fluxion encrypted WebSocket tunnels.",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -25,27 +25,29 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest --passWithNoTests",
     "clean": "node -e \"import('node:fs').then(({ rmSync }) => rmSync('dist', { recursive: true, force: true }))\"",
-    "prepublishOnly": "npm run clean && npm run build && npm run typecheck"
+    "prepublishOnly": "npm run clean && npm run build && npm run typecheck && npm run test"
   },
   "dependencies": {
-    "@aegis-fluxion/core": "^0.7.0",
-    "@aegis-fluxion/mcp-adapter": "^0.7.0"
+    "@aegis-fluxion/core": "^0.7.0"
   },
   "devDependencies": {
     "tsup": "^8.3.5",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
   },
   "engines": {
     "node": ">=18.18.0"
   },
   "keywords": [
+    "mcp",
+    "model-context-protocol",
     "websocket",
-    "e2e-encryption",
+    "secure-transport",
     "aes-gcm",
-    "ecdh",
-    "secure-messaging",
-    "ack"
+    "json-rpc"
   ],
   "license": "MIT"
 }

@@ -36,6 +36,7 @@ interface SecureServerClient {
     id: string;
     socket: WebSocket;
     request: IncomingMessage;
+    metadata: ReadonlyMap<string, unknown>;
     emit: (event: string, data: unknown, callbackOrOptions?: SecureAckCallback | SecureAckOptions, maybeCallback?: SecureAckCallback) => boolean | Promise<unknown>;
     join: (room: string) => boolean;
     leave: (room: string) => boolean;
@@ -67,6 +68,22 @@ interface SecureClientEventMap {
     ready: SecureClientReadyHandler;
     error: SecureErrorHandler;
 }
+interface SecureServerConnectionMiddlewareContext {
+    phase: "connection";
+    socket: WebSocket;
+    request: IncomingMessage;
+    metadata: Map<string, unknown>;
+}
+interface SecureServerMessageMiddlewareContext {
+    phase: "incoming" | "outgoing";
+    client: SecureServerClient;
+    event: string;
+    data: unknown;
+    metadata: Map<string, unknown>;
+}
+type SecureServerMiddlewareContext = SecureServerConnectionMiddlewareContext | SecureServerMessageMiddlewareContext;
+type SecureServerMiddlewareNext = () => Promise<void>;
+type SecureServerMiddleware = (context: SecureServerMiddlewareContext, next: SecureServerMiddlewareNext) => void | Promise<void>;
 declare class SecureServer {
     private readonly socketServer;
     private readonly heartbeatConfig;
@@ -78,7 +95,9 @@ declare class SecureServer {
     private readonly disconnectHandlers;
     private readonly readyHandlers;
     private readonly errorHandlers;
+    private readonly middlewareHandlers;
     private readonly handshakeStateBySocket;
+    private readonly middlewareMetadataBySocket;
     private readonly sharedSecretBySocket;
     private readonly encryptionKeyBySocket;
     private readonly pendingPayloadsBySocket;
@@ -99,6 +118,7 @@ declare class SecureServer {
     off(event: "ready", handler: SecureServerReadyHandler): this;
     off(event: "error", handler: SecureErrorHandler): this;
     off(event: string, handler: SecureServerEventHandler): this;
+    use(middleware: SecureServerMiddleware): this;
     emit(event: string, data: unknown): this;
     emitTo(clientId: string, event: string, data: unknown): boolean;
     emitTo(clientId: string, event: string, data: unknown, callback: SecureAckCallback): boolean;
@@ -116,6 +136,9 @@ declare class SecureServer {
     private handleIncomingMessage;
     private handleDisconnection;
     private dispatchCustomEvent;
+    private executeServerMiddleware;
+    private applyMessageMiddleware;
+    private resolveClientBySocket;
     private sendRaw;
     private sendEncryptedEnvelope;
     private sendRpcRequest;
@@ -200,4 +223,4 @@ declare class SecureClient {
     private flushPendingPayloadQueue;
 }
 
-export { type SecureAckCallback, type SecureAckOptions, type SecureBinaryPayload, SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureClientReconnectOptions, type SecureEnvelope, type SecureErrorHandler, SecureServer, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerHeartbeatOptions, type SecureServerLifecycleEvent, type SecureServerOptions, type SecureServerReadyHandler, type SecureServerRoomOperator };
+export { type SecureAckCallback, type SecureAckOptions, type SecureBinaryPayload, SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureClientReconnectOptions, type SecureEnvelope, type SecureErrorHandler, SecureServer, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerConnectionMiddlewareContext, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerHeartbeatOptions, type SecureServerLifecycleEvent, type SecureServerMessageMiddlewareContext, type SecureServerMiddleware, type SecureServerMiddlewareContext, type SecureServerMiddlewareNext, type SecureServerOptions, type SecureServerReadyHandler, type SecureServerRoomOperator };

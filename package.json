@@ -1,21 +1,22 @@
 {
   "name": "aegis-fluxion-monorepo",
-  "version": "0.5.0",
+  "version": "0.7.0",
   "private": true,
   "description": "Monorepo for the aegis-fluxion E2E encrypted WebSocket toolkit.",
   "workspaces": [
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build -w @aegis-fluxion/core && npm run build -w aegis-fluxion",
+    "build": "npm run build -w @aegis-fluxion/core && npm run build -w @aegis-fluxion/mcp-adapter && npm run build -w aegis-fluxion",
     "dev": "npm run dev -w @aegis-fluxion/core",
-    "typecheck": "npm run typecheck -w @aegis-fluxion/core && npm run typecheck -w aegis-fluxion",
-    "test": "npm run test -w @aegis-fluxion/core && npm run test -w aegis-fluxion --if-present",
-    "clean": "npm run clean -w @aegis-fluxion/core && npm run clean -w aegis-fluxion",
+    "typecheck": "npm run build -w @aegis-fluxion/core && npm run typecheck -w @aegis-fluxion/core && npm run build -w @aegis-fluxion/mcp-adapter && npm run typecheck -w @aegis-fluxion/mcp-adapter && npm run typecheck -w aegis-fluxion",
+    "test": "npm run test -w @aegis-fluxion/core && npm run test -w @aegis-fluxion/mcp-adapter && npm run test -w aegis-fluxion --if-present",
+    "clean": "npm run clean -w @aegis-fluxion/core && npm run clean -w @aegis-fluxion/mcp-adapter && npm run clean -w aegis-fluxion",
     "publish:core": "npm publish -w @aegis-fluxion/core --access public",
+    "publish:mcp-adapter": "npm publish -w @aegis-fluxion/mcp-adapter --access public",
     "publish:umbrella": "npm publish -w aegis-fluxion --access public",
     "release:core": "npm run test && npm run build && npm run publish:core",
-    "release:all": "npm run test && npm run build && npm run publish:core && npm run publish:umbrella"
+    "release:all": "npm run test && npm run build && npm run publish:core && npm run publish:mcp-adapter && npm run publish:umbrella"
   },
   "engines": {
     "node": ">=18.18.0"

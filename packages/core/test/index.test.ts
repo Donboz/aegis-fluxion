@@ -933,4 +933,203 @@ describe("SecureServer and SecureClient encryption flow", () => {
       await wait(30);
     }
   });
+
+  it("runs connection middleware before handshake and rejects unauthorized clients", async () => {
+    const port = await getFreePort();
+    const server = new SecureServer({ port, host: "127.0.0.1" });
+
+    let unauthorizedErrorObserved = false;
+
+    server.on("error", (error) => {
+      if (/unauthorized api key/i.test(error.message)) {
+        unauthorizedErrorObserved = true;
+      }
+    });
+
+    server.use(async (context, next) => {
+      if (context.phase !== "connection") {
+        await next();
+        return;
+      }
+
+      const headerValue = context.request.headers["x-api-key"];
+      const apiKey = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+
+      if (apiKey !== "aegis-secret-key") {
+        throw new Error("Unauthorized API key");
+      }
+
+      context.metadata.set("auth.subject", "integration-user");
+      await next();
+    });
+
+    const unauthorizedSocket = new WebSocket(`ws://127.0.0.1:${port}`);
+    const authorizedClient = new SecureClient(`ws://127.0.0.1:${port}`, {
+      wsOptions: {
+        headers: {
+          "x-api-key": "aegis-secret-key"
+        }
+      },
+      reconnect: false
+    });
+
+    try {
+      const unauthorizedClose = withTimeout(
+        new Promise<{ code: number; reason: string }>((resolve) => {
+          unauthorizedSocket.on("close", (code, reason) => {
+            resolve({
+              code,
+              reason: reason.toString("utf8")
+            });
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "unauthorized close"
+      );
+
+      const serverReadyClientPromise = withTimeout(
+        new Promise<{
+          id: string;
+          metadata: ReadonlyMap<string, unknown>;
+        }>((resolve) => {
+          server.on("ready", (socket) => {
+            resolve({
+              id: socket.id,
+              metadata: socket.metadata
+            });
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "authorized server ready"
+      );
+
+      const authorizedReadyPromise = withTimeout(
+        new Promise<void>((resolve) => {
+          authorizedClient.on("ready", () => {
+            resolve();
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "authorized client ready"
+      );
+
+      const [deniedConnection, serverReadyClient] = await Promise.all([
+        unauthorizedClose,
+        serverReadyClientPromise,
+        authorizedReadyPromise
+      ]);
+
+      expect(deniedConnection.code).toBe(1008);
+      expect(deniedConnection.reason).toMatch(/unauthorized api key/i);
+      expect(unauthorizedErrorObserved).toBe(true);
+      expect(serverReadyClient.id.length).toBeGreaterThan(0);
+      expect(serverReadyClient.metadata.get("auth.subject")).toBe("integration-user");
+    } finally {
+      unauthorizedSocket.removeAllListeners();
+      unauthorizedSocket.close();
+      authorizedClient.disconnect();
+      server.close();
+      await wait(30);
+    }
+  });
+
+  it("runs incoming/outgoing middleware hooks and blocks disallowed events", async () => {
+    const port = await getFreePort();
+    const server = new SecureServer({ port, host: "127.0.0.1" });
+    const client = new SecureClient(`ws://127.0.0.1:${port}`, {
+      reconnect: false
+    });
+
+    let blockedHandlerTriggered = false;
+
+    server.use(async (context, next) => {
+      if (context.phase === "incoming") {
+        if (context.event === "message:blocked") {
+          throw new Error("Blocked by incoming middleware");
+        }
+
+        if (context.event === "message:echo") {
+          const payload = context.data as { value: string };
+          context.data = {
+            ...payload,
+            value: payload.value.toUpperCase(),
+            inbound: true
+          };
+        }
+      }
+
+      if (context.phase === "outgoing" && context.event === "message:echo:ack") {
+        const payload = context.data as {
+          value: string;
+          inbound: boolean;
+        };
+
+        context.data = {
+          ...payload,
+          outbound: true
+        };
+      }
+
+      await next();
+    });
+
+    server.on("message:echo", (payload, socket) => {
+      socket.emit("message:echo:ack", payload);
+    });
+
+    server.on("message:blocked", () => {
+      blockedHandlerTriggered = true;
+    });
+
+    try {
+      await Promise.all([
+        withTimeout(
+          new Promise<void>((resolve) => {
+            server.on("ready", () => {
+              resolve();
+            });
+          }),
+          TEST_TIMEOUT_MS,
+          "server ready for middleware hook test"
+        ),
+        withTimeout(
+          new Promise<void>((resolve) => {
+            client.on("ready", () => {
+              resolve();
+            });
+          }),
+          TEST_TIMEOUT_MS,
+          "client ready for middleware hook test"
+        )
+      ]);
+
+      const ackPromise = withTimeout(
+        new Promise<unknown>((resolve) => {
+          client.on("message:echo:ack", (payload) => {
+            resolve(payload);
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "middleware-transformed ACK"
+      );
+
+      expect(client.emit("message:echo", { value: "hello" })).toBe(true);
+      expect(client.emit("message:blocked", { value: "forbidden" })).toBe(true);
+
+      const ackPayload = await ackPromise;
+
+      expect(ackPayload).toEqual({
+        value: "HELLO",
+        inbound: true,
+        outbound: true
+      });
+
+      await wait(100);
+      expect(blockedHandlerTriggered).toBe(false);
+    } finally {
+      client.disconnect();
+      server.close();
+      await wait(30);
+    }
+  });
 });

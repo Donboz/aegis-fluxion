@@ -4,6 +4,8 @@ import WebSocket, { WebSocketServer } from 'ws';
 // src/index.ts
 var DEFAULT_CLOSE_CODE = 1e3;
 var DEFAULT_CLOSE_REASON = "";
+var POLICY_VIOLATION_CLOSE_CODE = 1008;
+var POLICY_VIOLATION_CLOSE_REASON = "Connection rejected by middleware.";
 var INTERNAL_HANDSHAKE_EVENT = "__handshake";
 var INTERNAL_RPC_REQUEST_EVENT = "__rpc:req";
 var INTERNAL_RPC_RESPONSE_EVENT = "__rpc:res";
@@ -357,7 +359,9 @@ var SecureServer = class {
   disconnectHandlers = /* @__PURE__ */ new Set();
   readyHandlers = /* @__PURE__ */ new Set();
   errorHandlers = /* @__PURE__ */ new Set();
+  middlewareHandlers = [];
   handshakeStateBySocket = /* @__PURE__ */ new WeakMap();
+  middlewareMetadataBySocket = /* @__PURE__ */ new WeakMap();
   sharedSecretBySocket = /* @__PURE__ */ new WeakMap();
   encryptionKeyBySocket = /* @__PURE__ */ new WeakMap();
   pendingPayloadsBySocket = /* @__PURE__ */ new WeakMap();
@@ -442,6 +446,19 @@ var SecureServer = class {
     } catch (error) {
       this.notifyError(
         normalizeToError(error, "Failed to remove server event handler.")
+      );
+    }
+    return this;
+  }
+  use(middleware) {
+    try {
+      if (typeof middleware !== "function") {
+        throw new Error("Server middleware must be a function.");
+      }
+      this.middlewareHandlers.push(middleware);
+    } catch (error) {
+      this.notifyError(
+        normalizeToError(error, "Failed to register server middleware.")
       );
     }
     return this;
@@ -531,6 +548,7 @@ var SecureServer = class {
           client.socket,
           new Error("Server closed before ACK response was received.")
         );
+        this.middlewareMetadataBySocket.delete(client.socket);
         if (client.socket.readyState === WebSocket.OPEN || client.socket.readyState === WebSocket.CONNECTING) {
           client.socket.close(code, reason);
         }
@@ -593,6 +611,7 @@ var SecureServer = class {
         this.pendingRpcRequestsBySocket.delete(socket);
         this.handshakeStateBySocket.delete(socket);
         this.heartbeatStateBySocket.delete(socket);
+        this.middlewareMetadataBySocket.delete(socket);
         socket.terminate();
         continue;
       }
@@ -622,17 +641,46 @@ var SecureServer = class {
   }
   bindSocketServerEvents() {
     this.socketServer.on("connection", (socket, request) => {
-      this.handleConnection(socket, request);
+      void this.handleConnection(socket, request);
     });
     this.socketServer.on("error", (error) => {
       this.notifyError(normalizeToError(error, "WebSocket server encountered an error."));
     });
   }
-  handleConnection(socket, request) {
+  async handleConnection(socket, request) {
+    const connectionMetadata = /* @__PURE__ */ new Map();
+    this.middlewareMetadataBySocket.set(socket, connectionMetadata);
+    try {
+      await this.executeServerMiddleware({
+        phase: "connection",
+        socket,
+        request,
+        metadata: connectionMetadata
+      });
+    } catch (error) {
+      const normalizedError = normalizeToError(
+        error,
+        "Connection middleware rejected the incoming socket."
+      );
+      this.notifyError(normalizedError);
+      this.middlewareMetadataBySocket.delete(socket);
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+        socket.close(
+          POLICY_VIOLATION_CLOSE_CODE,
+          normalizedError.message || POLICY_VIOLATION_CLOSE_REASON
+        );
+      }
+      return;
+    }
     try {
       const clientId = randomUUID();
       const handshakeState = this.createServerHandshakeState();
-      const client = this.createSecureServerClient(clientId, socket, request);
+      const client = this.createSecureServerClient(
+        clientId,
+        socket,
+        request,
+        connectionMetadata
+      );
       this.clientsById.set(clientId, client);
       this.clientIdBySocket.set(socket, clientId);
       this.handshakeStateBySocket.set(socket, handshakeState);
@@ -644,7 +692,7 @@ var SecureServer = class {
       });
       this.roomNamesByClientId.set(clientId, /* @__PURE__ */ new Set());
       socket.on("message", (rawData) => {
-        this.handleIncomingMessage(client, rawData);
+        void this.handleIncomingMessage(client, rawData);
       });
       socket.on("close", (code, reason) => {
         this.handleDisconnection(client, code, reason);
@@ -664,9 +712,10 @@ var SecureServer = class {
       this.notifyConnection(client);
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to handle client connection."));
+      this.middlewareMetadataBySocket.delete(socket);
     }
   }
-  handleIncomingMessage(client, rawData) {
+  async handleIncomingMessage(client, rawData) {
     try {
       let envelope = null;
       try {
@@ -710,10 +759,16 @@ var SecureServer = class {
         return;
       }
       if (decryptedEnvelope.event === INTERNAL_RPC_REQUEST_EVENT) {
-        void this.handleRpcRequest(client, decryptedEnvelope.data);
+        await this.handleRpcRequest(client, decryptedEnvelope.data);
         return;
       }
-      this.dispatchCustomEvent(decryptedEnvelope.event, decryptedEnvelope.data, client);
+      const interceptedData = await this.applyMessageMiddleware(
+        "incoming",
+        client,
+        decryptedEnvelope.event,
+        decryptedEnvelope.data
+      );
+      this.dispatchCustomEvent(decryptedEnvelope.event, interceptedData, client);
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to process incoming server message."));
     }
@@ -733,6 +788,7 @@ var SecureServer = class {
       );
       this.pendingRpcRequestsBySocket.delete(client.socket);
       this.heartbeatStateBySocket.delete(client.socket);
+      this.middlewareMetadataBySocket.delete(client.socket);
       const decodedReason = decodeCloseReason(reason);
       for (const handler of this.disconnectHandlers) {
         try {
@@ -777,6 +833,48 @@ var SecureServer = class {
         );
       }
     }
+  }
+  async executeServerMiddleware(context) {
+    if (this.middlewareHandlers.length === 0) {
+      return;
+    }
+    let currentIndex = -1;
+    const dispatch = async (index) => {
+      if (index <= currentIndex) {
+        throw new Error("Server middleware next() was called multiple times.");
+      }
+      currentIndex = index;
+      const middleware = this.middlewareHandlers[index];
+      if (!middleware) {
+        return;
+      }
+      await Promise.resolve(
+        middleware(context, async () => {
+          await dispatch(index + 1);
+        })
+      );
+    };
+    await dispatch(0);
+  }
+  async applyMessageMiddleware(phase, client, event, data) {
+    const metadata = this.middlewareMetadataBySocket.get(client.socket) ?? /* @__PURE__ */ new Map();
+    this.middlewareMetadataBySocket.set(client.socket, metadata);
+    const middlewareContext = {
+      phase,
+      client,
+      event,
+      data,
+      metadata
+    };
+    await this.executeServerMiddleware(middlewareContext);
+    return middlewareContext.data;
+  }
+  resolveClientBySocket(socket) {
+    const clientId = this.clientIdBySocket.get(socket);
+    if (!clientId) {
+      return null;
+    }
+    return this.clientsById.get(clientId) ?? null;
   }
   sendRaw(socket, payload) {
     try {
@@ -875,9 +973,15 @@ var SecureServer = class {
       return;
     }
     try {
+      const interceptedData = await this.applyMessageMiddleware(
+        "incoming",
+        client,
+        rpcRequestPayload.event,
+        rpcRequestPayload.data
+      );
       const ackResponse = await this.executeRpcRequestHandler(
         rpcRequestPayload.event,
-        rpcRequestPayload.data,
+        interceptedData,
         client
       );
       await this.sendEncryptedEnvelope(client.socket, {
@@ -994,12 +1098,28 @@ var SecureServer = class {
   isClientHandshakeReady(socket) {
     return this.handshakeStateBySocket.get(socket)?.isReady ?? false;
   }
-  sendOrQueuePayload(socket, envelope) {
-    if (!this.isClientHandshakeReady(socket)) {
-      this.queuePayload(socket, envelope);
-      return Promise.resolve();
+  async sendOrQueuePayload(socket, envelope) {
+    let interceptedEnvelope = envelope;
+    if (!isReservedEmitEvent(envelope.event)) {
+      const targetClient = this.resolveClientBySocket(socket);
+      if (targetClient) {
+        const interceptedData = await this.applyMessageMiddleware(
+          "outgoing",
+          targetClient,
+          envelope.event,
+          envelope.data
+        );
+        interceptedEnvelope = {
+          event: envelope.event,
+          data: interceptedData
+        };
+      }
     }
-    return this.sendEncryptedEnvelope(socket, envelope);
+    if (!this.isClientHandshakeReady(socket)) {
+      this.queuePayload(socket, interceptedEnvelope);
+      return;
+    }
+    await this.sendEncryptedEnvelope(socket, interceptedEnvelope);
   }
   queuePayload(socket, envelope) {
     const pendingPayloads = this.pendingPayloadsBySocket.get(socket) ?? [];
@@ -1016,11 +1136,12 @@ var SecureServer = class {
       await this.sendEncryptedEnvelope(socket, envelope);
     }
   }
-  createSecureServerClient(clientId, socket, request) {
+  createSecureServerClient(clientId, socket, request, metadata) {
     return {
       id: clientId,
       socket,
       request,
+      metadata,
       emit: (event, data, callbackOrOptions, maybeCallback) => {
         if (callbackOrOptions === void 0 && maybeCallback === void 0) {
           return this.emitTo(clientId, event, data);

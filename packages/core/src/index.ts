@@ -17,6 +17,8 @@ import type {
 
 const DEFAULT_CLOSE_CODE = 1000;
 const DEFAULT_CLOSE_REASON = "";
+const POLICY_VIOLATION_CLOSE_CODE = 1008;
+const POLICY_VIOLATION_CLOSE_REASON = "Connection rejected by middleware.";
 const INTERNAL_HANDSHAKE_EVENT = "__handshake";
 const INTERNAL_RPC_REQUEST_EVENT = "__rpc:req";
 const INTERNAL_RPC_RESPONSE_EVENT = "__rpc:res";
@@ -136,6 +138,7 @@ export interface SecureServerClient {
   id: string;
   socket: WebSocket;
   request: IncomingMessage;
+  metadata: ReadonlyMap<string, unknown>;
   emit: (
     event: string,
     data: unknown,
@@ -206,6 +209,32 @@ export interface SecureClientEventMap {
   ready: SecureClientReadyHandler;
   error: SecureErrorHandler;
 }
+
+export interface SecureServerConnectionMiddlewareContext {
+  phase: "connection";
+  socket: WebSocket;
+  request: IncomingMessage;
+  metadata: Map<string, unknown>;
+}
+
+export interface SecureServerMessageMiddlewareContext {
+  phase: "incoming" | "outgoing";
+  client: SecureServerClient;
+  event: string;
+  data: unknown;
+  metadata: Map<string, unknown>;
+}
+
+export type SecureServerMiddlewareContext =
+  | SecureServerConnectionMiddlewareContext
+  | SecureServerMessageMiddlewareContext;
+
+export type SecureServerMiddlewareNext = () => Promise<void>;
+
+export type SecureServerMiddleware = (
+  context: SecureServerMiddlewareContext,
+  next: SecureServerMiddlewareNext
+) => void | Promise<void>;
 
 function normalizeToError(error: unknown, fallbackMessage: string): Error {
   if (error instanceof Error) {
@@ -674,7 +703,14 @@ export class SecureServer {
 
   private readonly errorHandlers = new Set<SecureErrorHandler>();
 
+  private readonly middlewareHandlers: SecureServerMiddleware[] = [];
+
   private readonly handshakeStateBySocket = new WeakMap<WebSocket, ServerHandshakeState>();
+
+  private readonly middlewareMetadataBySocket = new WeakMap<
+    WebSocket,
+    Map<string, unknown>
+  >();
 
   private readonly sharedSecretBySocket = new WeakMap<WebSocket, Buffer>();
 
@@ -802,6 +838,22 @@ export class SecureServer {
     } catch (error) {
       this.notifyError(
         normalizeToError(error, "Failed to remove server event handler.")
+      );
+    }
+
+    return this;
+  }
+
+  public use(middleware: SecureServerMiddleware): this {
+    try {
+      if (typeof middleware !== "function") {
+        throw new Error("Server middleware must be a function.");
+      }
+
+      this.middlewareHandlers.push(middleware);
+    } catch (error) {
+      this.notifyError(
+        normalizeToError(error, "Failed to register server middleware.")
       );
     }
 
@@ -944,6 +996,7 @@ export class SecureServer {
           client.socket,
           new Error("Server closed before ACK response was received.")
         );
+        this.middlewareMetadataBySocket.delete(client.socket);
 
         if (
           client.socket.readyState === WebSocket.OPEN ||
@@ -1030,6 +1083,7 @@ export class SecureServer {
         this.pendingRpcRequestsBySocket.delete(socket);
         this.handshakeStateBySocket.delete(socket);
         this.heartbeatStateBySocket.delete(socket);
+        this.middlewareMetadataBySocket.delete(socket);
         socket.terminate();
         continue;
       }
@@ -1066,7 +1120,7 @@ export class SecureServer {
 
   private bindSocketServerEvents(): void {
     this.socketServer.on("connection", (socket: WebSocket, request: IncomingMessage) => {
-      this.handleConnection(socket, request);
+      void this.handleConnection(socket, request);
     });
 
     this.socketServer.on("error", (error: Error) => {
@@ -1074,11 +1128,48 @@ export class SecureServer {
     });
   }
 
-  private handleConnection(socket: WebSocket, request: IncomingMessage): void {
+  private async handleConnection(socket: WebSocket, request: IncomingMessage): Promise<void> {
+    const connectionMetadata = new Map<string, unknown>();
+    this.middlewareMetadataBySocket.set(socket, connectionMetadata);
+
+    try {
+      await this.executeServerMiddleware({
+        phase: "connection",
+        socket,
+        request,
+        metadata: connectionMetadata
+      });
+    } catch (error) {
+      const normalizedError = normalizeToError(
+        error,
+        "Connection middleware rejected the incoming socket."
+      );
+
+      this.notifyError(normalizedError);
+      this.middlewareMetadataBySocket.delete(socket);
+
+      if (
+        socket.readyState === WebSocket.OPEN ||
+        socket.readyState === WebSocket.CONNECTING
+      ) {
+        socket.close(
+          POLICY_VIOLATION_CLOSE_CODE,
+          normalizedError.message || POLICY_VIOLATION_CLOSE_REASON
+        );
+      }
+
+      return;
+    }
+
     try {
       const clientId = randomUUID();
       const handshakeState = this.createServerHandshakeState();
-      const client = this.createSecureServerClient(clientId, socket, request);
+      const client = this.createSecureServerClient(
+        clientId,
+        socket,
+        request,
+        connectionMetadata
+      );
 
       this.clientsById.set(clientId, client);
       this.clientIdBySocket.set(socket, clientId);
@@ -1092,7 +1183,7 @@ export class SecureServer {
       this.roomNamesByClientId.set(clientId, new Set<string>());
 
       socket.on("message", (rawData: RawData) => {
-        this.handleIncomingMessage(client, rawData);
+        void this.handleIncomingMessage(client, rawData);
       });
 
       socket.on("close", (code: number, reason: Buffer) => {
@@ -1116,10 +1207,14 @@ export class SecureServer {
       this.notifyConnection(client);
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to handle client connection."));
+      this.middlewareMetadataBySocket.delete(socket);
     }
   }
 
-  private handleIncomingMessage(client: SecureServerClient, rawData: RawData): void {
+  private async handleIncomingMessage(
+    client: SecureServerClient,
+    rawData: RawData
+  ): Promise<void> {
     try {
       let envelope: SecureEnvelope | null = null;
 
@@ -1174,11 +1269,18 @@ export class SecureServer {
       }
 
       if (decryptedEnvelope.event === INTERNAL_RPC_REQUEST_EVENT) {
-        void this.handleRpcRequest(client, decryptedEnvelope.data);
+        await this.handleRpcRequest(client, decryptedEnvelope.data);
         return;
       }
 
-      this.dispatchCustomEvent(decryptedEnvelope.event, decryptedEnvelope.data, client);
+      const interceptedData = await this.applyMessageMiddleware(
+        "incoming",
+        client,
+        decryptedEnvelope.event,
+        decryptedEnvelope.data
+      );
+
+      this.dispatchCustomEvent(decryptedEnvelope.event, interceptedData, client);
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to process incoming server message."));
     }
@@ -1199,6 +1301,7 @@ export class SecureServer {
       );
       this.pendingRpcRequestsBySocket.delete(client.socket);
       this.heartbeatStateBySocket.delete(client.socket);
+      this.middlewareMetadataBySocket.delete(client.socket);
 
       const decodedReason = decodeCloseReason(reason);
 
@@ -1253,6 +1356,70 @@ export class SecureServer {
         );
       }
     }
+  }
+
+  private async executeServerMiddleware(
+    context: SecureServerMiddlewareContext
+  ): Promise<void> {
+    if (this.middlewareHandlers.length === 0) {
+      return;
+    }
+
+    let currentIndex = -1;
+
+    const dispatch = async (index: number): Promise<void> => {
+      if (index <= currentIndex) {
+        throw new Error("Server middleware next() was called multiple times.");
+      }
+
+      currentIndex = index;
+      const middleware = this.middlewareHandlers[index];
+
+      if (!middleware) {
+        return;
+      }
+
+      await Promise.resolve(
+        middleware(context, async () => {
+          await dispatch(index + 1);
+        })
+      );
+    };
+
+    await dispatch(0);
+  }
+
+  private async applyMessageMiddleware(
+    phase: "incoming" | "outgoing",
+    client: SecureServerClient,
+    event: string,
+    data: unknown
+  ): Promise<unknown> {
+    const metadata =
+      this.middlewareMetadataBySocket.get(client.socket) ?? new Map<string, unknown>();
+
+    this.middlewareMetadataBySocket.set(client.socket, metadata);
+
+    const middlewareContext: SecureServerMessageMiddlewareContext = {
+      phase,
+      client,
+      event,
+      data,
+      metadata
+    };
+
+    await this.executeServerMiddleware(middlewareContext);
+    return middlewareContext.data;
+  }
+
+  private resolveClientBySocket(socket: WebSocket): SecureServerClient | null {
+    const clientId = this.clientIdBySocket.get(socket);
+
+    if (!clientId) {
+      return null;
+    }
+
+    return this.clientsById.get(clientId) ?? null;
   }
 
   private sendRaw(socket: WebSocket, payload: string): void {
@@ -1380,9 +1547,16 @@ export class SecureServer {
     }
 
     try {
+      const interceptedData = await this.applyMessageMiddleware(
+        "incoming",
+        client,
+        rpcRequestPayload.event,
+        rpcRequestPayload.data
+      );
+
       const ackResponse = await this.executeRpcRequestHandler(
         rpcRequestPayload.event,
-        rpcRequestPayload.data,
+        interceptedData,
         client
       );
 
@@ -1529,13 +1703,36 @@ export class SecureServer {
     return this.handshakeStateBySocket.get(socket)?.isReady ?? false;
   }
 
-  private sendOrQueuePayload(socket: WebSocket, envelope: SecureEnvelope): Promise<void> {
-    if (!this.isClientHandshakeReady(socket)) {
-      this.queuePayload(socket, envelope);
-      return Promise.resolve();
+  private async sendOrQueuePayload(
+    socket: WebSocket,
+    envelope: SecureEnvelope
+  ): Promise<void> {
+    let interceptedEnvelope = envelope;
+
+    if (!isReservedEmitEvent(envelope.event)) {
+      const targetClient = this.resolveClientBySocket(socket);
+
+      if (targetClient) {
+        const interceptedData = await this.applyMessageMiddleware(
+          "outgoing",
+          targetClient,
+          envelope.event,
+          envelope.data
+        );
+
+        interceptedEnvelope = {
+          event: envelope.event,
+          data: interceptedData
+        };
+      }
     }
 
-    return this.sendEncryptedEnvelope(socket, envelope);
+    if (!this.isClientHandshakeReady(socket)) {
+      this.queuePayload(socket, interceptedEnvelope);
+      return;
+    }
+
+    await this.sendEncryptedEnvelope(socket, interceptedEnvelope);
   }
 
   private queuePayload(socket: WebSocket, envelope: SecureEnvelope): void {
@@ -1561,12 +1758,14 @@ export class SecureServer {
   private createSecureServerClient(
     clientId: string,
     socket: WebSocket,
-    request: IncomingMessage
+    request: IncomingMessage,
+    metadata: Map<string, unknown>
   ): SecureServerClient {
     return {
       id: clientId,
       socket,
       request,
+      metadata,
       emit: (
         event: string,
         data: unknown,
