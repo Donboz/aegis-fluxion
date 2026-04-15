@@ -68,6 +68,13 @@ export interface SecureServerClient {
   id: string;
   socket: WebSocket;
   request: IncomingMessage;
+  join: (room: string) => boolean;
+  leave: (room: string) => boolean;
+  leaveAll: () => number;
+}
+
+export interface SecureServerRoomOperator {
+  emit: (event: string, data: unknown) => SecureServer;
 }
 
 export type SecureErrorHandler = (error: Error) => void;
@@ -347,6 +354,10 @@ export class SecureServer {
 
   private readonly pendingPayloadsBySocket = new WeakMap<WebSocket, SecureEnvelope[]>();
 
+  private readonly roomMembersByName = new Map<string, Set<string>>();
+
+  private readonly roomNamesByClientId = new Map<string, Set<string>>();
+
   public constructor(options: SecureServerOptions) {
     this.socketServer = new WebSocketServer(options);
     this.bindSocketServerEvents();
@@ -493,6 +504,24 @@ export class SecureServer {
     }
   }
 
+  public to(room: string): SecureServerRoomOperator {
+    const normalizedRoom = this.normalizeRoomName(room);
+
+    return {
+      emit: (event: string, data: unknown): SecureServer => {
+        try {
+          this.emitToRoom(normalizedRoom, event, data);
+        } catch (error) {
+          this.notifyError(
+            normalizeToError(error, `Failed to emit event to room ${normalizedRoom}.`)
+          );
+        }
+
+        return this;
+      }
+    };
+  }
+
   public close(
     code: number = DEFAULT_CLOSE_CODE,
     reason: string = DEFAULT_CLOSE_REASON
@@ -527,16 +556,13 @@ export class SecureServer {
     try {
       const clientId = randomUUID();
       const handshakeState = this.createServerHandshakeState();
-      const client: SecureServerClient = {
-        id: clientId,
-        socket,
-        request
-      };
+      const client = this.createSecureServerClient(clientId, socket, request);
 
       this.clientsById.set(clientId, client);
       this.clientIdBySocket.set(socket, clientId);
       this.handshakeStateBySocket.set(socket, handshakeState);
       this.pendingPayloadsBySocket.set(socket, []);
+      this.roomNamesByClientId.set(clientId, new Set<string>());
 
       socket.on("message", (rawData: RawData) => {
         this.handleIncomingMessage(client, rawData);
@@ -618,6 +644,7 @@ export class SecureServer {
 
   private handleDisconnection(client: SecureServerClient, code: number, reason: Buffer): void {
     try {
+      client.leaveAll();
       this.clientsById.delete(client.id);
       this.clientIdBySocket.delete(client.socket);
       this.handshakeStateBySocket.delete(client.socket);
@@ -819,6 +846,136 @@ export class SecureServer {
 
     for (const envelope of pendingPayloads) {
       this.sendEncryptedEnvelope(socket, envelope);
+    }
+  }
+
+  private createSecureServerClient(
+    clientId: string,
+    socket: WebSocket,
+    request: IncomingMessage
+  ): SecureServerClient {
+    return {
+      id: clientId,
+      socket,
+      request,
+      join: (room: string): boolean => this.joinClientToRoom(clientId, room),
+      leave: (room: string): boolean => this.leaveClientFromRoom(clientId, room),
+      leaveAll: (): number => this.leaveClientFromAllRooms(clientId)
+    };
+  }
+
+  private normalizeRoomName(room: string): string {
+    if (typeof room !== "string") {
+      throw new Error("Room name must be a string.");
+    }
+
+    const normalizedRoom = room.trim();
+
+    if (normalizedRoom.length === 0) {
+      throw new Error("Room name cannot be empty.");
+    }
+
+    return normalizedRoom;
+  }
+
+  private joinClientToRoom(clientId: string, room: string): boolean {
+    const normalizedRoom = this.normalizeRoomName(room);
+
+    if (!this.clientsById.has(clientId)) {
+      return false;
+    }
+
+    const clientRooms = this.roomNamesByClientId.get(clientId) ?? new Set<string>();
+
+    if (clientRooms.has(normalizedRoom)) {
+      this.roomNamesByClientId.set(clientId, clientRooms);
+      return false;
+    }
+
+    clientRooms.add(normalizedRoom);
+    this.roomNamesByClientId.set(clientId, clientRooms);
+
+    const roomMembers = this.roomMembersByName.get(normalizedRoom) ?? new Set<string>();
+    roomMembers.add(clientId);
+    this.roomMembersByName.set(normalizedRoom, roomMembers);
+
+    return true;
+  }
+
+  private leaveClientFromRoom(clientId: string, room: string): boolean {
+    const normalizedRoom = this.normalizeRoomName(room);
+    const clientRooms = this.roomNamesByClientId.get(clientId);
+
+    if (!clientRooms || !clientRooms.delete(normalizedRoom)) {
+      return false;
+    }
+
+    if (clientRooms.size === 0) {
+      this.roomNamesByClientId.delete(clientId);
+    }
+
+    const roomMembers = this.roomMembersByName.get(normalizedRoom);
+
+    if (roomMembers) {
+      roomMembers.delete(clientId);
+
+      if (roomMembers.size === 0) {
+        this.roomMembersByName.delete(normalizedRoom);
+      }
+    }
+
+    return true;
+  }
+
+  private leaveClientFromAllRooms(clientId: string): number {
+    const clientRooms = this.roomNamesByClientId.get(clientId);
+
+    if (!clientRooms || clientRooms.size === 0) {
+      this.roomNamesByClientId.delete(clientId);
+      return 0;
+    }
+
+    const roomNames = [...clientRooms];
+    this.roomNamesByClientId.delete(clientId);
+
+    for (const roomName of roomNames) {
+      const roomMembers = this.roomMembersByName.get(roomName);
+
+      if (!roomMembers) {
+        continue;
+      }
+
+      roomMembers.delete(clientId);
+
+      if (roomMembers.size === 0) {
+        this.roomMembersByName.delete(roomName);
+      }
+    }
+
+    return roomNames.length;
+  }
+
+  private emitToRoom(room: string, event: string, data: unknown): void {
+    if (isReservedEmitEvent(event)) {
+      throw new Error(`The event "${event}" is reserved and cannot be emitted manually.`);
+    }
+
+    const roomMembers = this.roomMembersByName.get(room);
+
+    if (!roomMembers || roomMembers.size === 0) {
+      return;
+    }
+
+    const envelope: SecureEnvelope = { event, data };
+
+    for (const clientId of roomMembers) {
+      const client = this.clientsById.get(clientId);
+
+      if (!client) {
+        continue;
+      }
+
+      this.sendOrQueuePayload(client.socket, envelope);
     }
   }
 }

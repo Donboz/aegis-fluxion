@@ -1,90 +1,81 @@
 # aegis-fluxion
 
-A production-oriented, TypeScript-first secure transport toolkit for WebSocket-based systems.
+![Version](https://img.shields.io/badge/version-0.2.0-2563eb)
+![Node](https://img.shields.io/badge/node-%3E%3D18.18.0-16a34a)
+![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178c6)
+![Crypto](https://img.shields.io/badge/Crypto-ECDH%20%2B%20AES--256--GCM-0f172a)
 
-`aegis-fluxion` delivers **end-to-end encrypted messaging** with **zero external cryptography dependencies** (built entirely on native Node.js `crypto`) and is designed to serve as a hardened custom transport layer for AI agent communication, including **Anthropic MCP (Model Context Protocol)** integrations.
+Secure, production-ready WebSocket transport primitives for modern TypeScript systems.
+
+`aegis-fluxion` provides **application-layer end-to-end encryption** and now includes **Secure Rooms** with Socket.IO-like ergonomics:
+
+- `socket.join("room")`
+- `socket.leave("room")`
+- `server.to("room").emit("event", data)`
+
+> Even when broadcasting to a room, each recipient receives a separately encrypted packet using that connection’s own ECDH-derived AES-GCM key.
 
 ## Table of Contents
 
 - [Why aegis-fluxion](#why-aegis-fluxion)
-- [Security Model](#security-model)
-- [Key Features](#key-features)
-- [Architecture Overview](#architecture-overview)
+- [What’s New in v0.2.0](#whats-new-in-v020)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
   - [Secure Server](#secure-server)
   - [Secure Client](#secure-client)
-- [How It Works](#how-it-works)
+- [Secure Rooms](#secure-rooms)
+- [Security Architecture](#security-architecture)
+- [API Overview](#api-overview)
 - [Testing](#testing)
 - [Project Structure](#project-structure)
-- [MCP and AI Agent Use Cases](#mcp-and-ai-agent-use-cases)
+- [AI & MCP Vision](#ai--mcp-vision)
 - [Operational Notes](#operational-notes)
-- [Roadmap](#roadmap)
 - [License](#license)
 
 ## Why aegis-fluxion
 
-Most agent and tool protocols rely on transport-level TLS only. TLS is necessary but not always sufficient for multi-hop infrastructure, long-lived sessions, proxy chains, or custom gateway topologies.
+TLS is necessary, but for many systems it is not sufficient.
 
-`aegis-fluxion` adds a protocol-level security layer directly in your WebSocket event flow:
+When traffic crosses proxies, gateways, sidecars, or long-lived internal meshes, application-level payload protection becomes essential.
 
-- Per-connection ephemeral key exchange
-- Derived symmetric session keys
-- Authenticated encryption for every application packet
-- Transparent developer API (`emit` / `on`) without cryptographic ceremony in business code
+`aegis-fluxion` adds protocol-native cryptographic guarantees directly into your event flow:
 
-## Security Model
+- Ephemeral ECDH handshake per connection (PFS-oriented)
+- AES-256-GCM authenticated encryption for each message
+- Tamper rejection by default
+- Clean developer API with no cryptography boilerplate in business handlers
 
-- **Key Exchange**: Ephemeral ECDH (`prime256v1`) on each connection
-- **Key Derivation**: SHA-256 derivation to guaranteed 32-byte AES key material
-- **Payload Encryption**: AES-256-GCM with per-message random IV (`12 bytes`)
-- **Integrity and Tamper Detection**: GCM authentication tag validation on receive
-- **Anti-Tampering Behavior**: Modified packets are dropped and never dispatched to user handlers
-- **Secret Hygiene**: No private keys or shared secrets are logged
-- **Memory Safety**: Connection-scoped secret material is cleared when socket disconnects
+## What’s New in v0.2.0
 
-## Key Features
+### Secure Rooms
 
-- E2E encrypted event transport over WebSocket
-- Socket.IO-like developer ergonomics with `emit(event, data)` and `on(event, handler)`
-- Handshake and encryption logic hidden behind a stable public API
-- Ready-gating: user-level traffic is blocked/queued until secure session is established
-- TypeScript-native event handler and options typing
-- Vitest integration tests for normal encrypted flow and tamper rejection behavior
+- Added server-side room membership management:
+  - `socket.join(room)`
+  - `socket.leave(room)`
+  - `socket.leaveAll()`
+- Added room-targeted emit API:
+  - `server.to(room).emit(event, data)`
 
-## Architecture Overview
+### Cryptographic Safety Preserved
 
-`aegis-fluxion` is currently organized as a workspace monorepo.
-
-```text
-.
-├── package.json
-└── packages/
-    └── core/
-        ├── src/
-        │   └── index.ts
-        ├── test/
-        │   └── index.test.ts
-        ├── tsconfig.json
-        └── tsup.config.ts
-```
+Room broadcasts do **not** use a shared room key. Instead, the server encrypts per recipient, per packet, with that recipient’s own session key.
 
 ## Installation
 
-### Monorepo (current repository)
+### Monorepo (this repository)
 
 ```bash
 npm install
 npm run build
 ```
 
-### Package usage (when published)
+### Package usage
 
 ```bash
 npm install @aegis-fluxion/core ws
 ```
 
-> Note: The cryptographic layer itself has no third-party crypto dependency. The transport runtime depends on `ws`.
+> The cryptographic layer uses native Node.js `crypto` only (no third-party crypto package).
 
 ## Quick Start
 
@@ -98,21 +89,28 @@ const server = new SecureServer({
   port: 8080
 });
 
-server.on("connection", (client) => {
-  console.log(`Client connected: ${client.id}`);
+server.on("connection", (socket) => {
+  console.log(`Connected: ${socket.id}`);
+
+  // Room assignment on connection
+  socket.join("agents:ops");
 });
 
-server.on("ready", (client) => {
-  console.log(`Secure session established: ${client.id}`);
+server.on("ready", (socket) => {
+  console.log(`Secure channel ready: ${socket.id}`);
+  server.emitTo(socket.id, "session:ready", { ok: true });
 });
 
-server.on("task", (payload, client) => {
-  // Business payload is already decrypted and integrity-validated.
-  server.emitTo(client.id, "task:ack", { ok: true, received: payload });
+server.on("chat:send", (payload, socket) => {
+  // Route only to room members, still encrypted per recipient.
+  server.to("agents:ops").emit("chat:message", {
+    from: socket.id,
+    body: payload
+  });
 });
 
-server.on("disconnect", (client, code, reason) => {
-  console.log(`Client disconnected: ${client.id} (${code} ${reason})`);
+server.on("disconnect", (socket, code, reason) => {
+  console.log(`Disconnected: ${socket.id} (${code} ${reason})`);
 });
 
 server.on("error", (error) => {
@@ -130,16 +128,20 @@ const client = new SecureClient("ws://127.0.0.1:8080", {
 });
 
 client.on("connect", () => {
-  console.log("Socket connected. Waiting for secure ready state...");
+  console.log("Transport connected, waiting for cryptographic ready...");
 });
 
 client.on("ready", () => {
-  console.log("Secure channel ready.");
-  client.emit("task", { id: "job-1", action: "run" });
+  console.log("Secure channel established.");
+  client.emit("chat:send", "hello secure room");
 });
 
-client.on("task:ack", (payload) => {
-  console.log("Encrypted response received:", payload);
+client.on("session:ready", (payload) => {
+  console.log("Server session ack:", payload);
+});
+
+client.on("chat:message", (payload) => {
+  console.log("Encrypted room message received:", payload);
 });
 
 client.on("disconnect", (code, reason) => {
@@ -151,25 +153,98 @@ client.on("error", (error) => {
 });
 ```
 
-## How It Works
+## Secure Rooms
 
-1. Server accepts connection.
-2. Both sides generate ephemeral ECDH key pairs.
-3. Internal handshake (`__handshake`) exchanges public keys.
-4. Both sides compute shared secret and derive a 32-byte session key.
-5. `ready` event is emitted.
-6. All user messages are encrypted as:
-   - `version (1 byte)`
-   - `iv (12 bytes)`
-   - `authTag (16 bytes)`
-   - `ciphertext (N bytes)`
-7. Receiver validates auth tag before dispatching user events.
+Rooms are managed server-side and designed for strict encrypted delivery.
 
-If validation fails, the payload is dropped and not delivered to user handlers.
+```ts
+server.on("connection", (socket) => {
+  socket.join("alerts");
+});
+
+// Later in business logic
+server.to("alerts").emit("alert:new", {
+  severity: "high",
+  message: "Integrity check failed on worker-07"
+});
+```
+
+Remove a socket from a room:
+
+```ts
+server.on("mute:alerts", (_, socket) => {
+  socket.leave("alerts");
+});
+```
+
+> No plaintext fan-out is performed for rooms. Each outbound payload is serialized and encrypted separately for each destination socket.
+
+## Security Architecture
+
+### Handshake
+
+1. Client and server generate ephemeral ECDH keys (`prime256v1`).
+2. Public keys are exchanged via internal handshake event.
+3. Shared secret is derived on both ends.
+4. AES key material is derived via SHA-256 (`32 bytes`).
+
+### Packet Format
+
+Every encrypted payload is structured as:
+
+- `version` (1 byte)
+- `iv` (12 bytes)
+- `authTag` (16 bytes)
+- `ciphertext` (N bytes)
+
+### Confidentiality + Integrity
+
+- Cipher: `AES-256-GCM`
+- New IV per message
+- Auth tag required for successful decryption
+- Tampered payloads are dropped silently from business event dispatch
+
+### Secure Rooms Guarantee
+
+When `server.to(room).emit(...)` is called:
+
+- The room membership set is resolved on server side.
+- The same logical event is encrypted individually for each socket.
+- Each encryption operation uses that socket’s own ECDH-derived session key.
+
+This preserves E2E semantics for room broadcasts.
+
+## API Overview
+
+### `SecureServer`
+
+- `on("connection", handler)`
+- `on("ready", handler)`
+- `on("disconnect", handler)`
+- `on("error", handler)`
+- `on("event", (data, socket) => void)`
+- `emit(event, data)` (broadcast to all connected sockets)
+- `emitTo(clientId, event, data)`
+- `to(room).emit(event, data)`
+- `close(code?, reason?)`
+
+### `SecureServerClient` (socket object on server)
+
+- `id: string`
+- `join(room): boolean`
+- `leave(room): boolean`
+- `leaveAll(): number`
+
+### `SecureClient`
+
+- `connect()` / `disconnect(code?, reason?)`
+- `emit(event, data)`
+- `on("connect" | "ready" | "disconnect" | "error", handler)`
+- `on("event", handler)`
 
 ## Testing
 
-Run all validation commands:
+Run all checks from the repository root:
 
 ```bash
 npm run typecheck
@@ -177,46 +252,45 @@ npm run test
 npm run build
 ```
 
-Current test coverage includes:
+Current integration coverage includes:
 
-- Successful encrypted communication between `SecureClient` and `SecureServer`
-- Tampered packet rejection (Auth Tag failure path) without transport crash
+- encrypted client/server exchange
+- tampered packet rejection without transport crash
+- secure rooms join/leave and room-scoped emits
 
 ## Project Structure
 
-- `packages/core/src/index.ts`
-  - Secure transport implementation
-  - ECDH handshake
-  - AES-256-GCM encryption/decryption
-  - Public TypeScript types and classes
-- `packages/core/test/index.test.ts`
-  - Integration-style security flow tests
+```text
+.
+├── package.json
+├── README.md
+└── packages/
+    └── core/
+        ├── src/
+        │   └── index.ts
+        ├── test/
+        │   └── index.test.ts
+        ├── tsconfig.json
+        └── tsup.config.ts
+```
 
-## MCP and AI Agent Use Cases
+## AI & MCP Vision
 
-`aegis-fluxion` is a practical fit for AI infrastructure where transport hardening matters:
+`aegis-fluxion` is built for systems that need cryptographically hardened event transport, including:
 
-- Anthropic MCP gateway-to-agent links
-- Multi-agent orchestration over WebSocket
-- Tooling backplanes where packet integrity must be enforced
-- Custom secure transport adapters for model runtime services
+- AI agent backplanes
+- MCP transport adapters
+- multi-agent orchestration channels
+- secure tool execution networks
 
-By keeping the cryptography layer protocol-native and API-transparent, teams can integrate secure transport without rewriting agent/business logic.
+By keeping security protocol-native and API-minimal, teams can integrate hardened messaging without rewriting application business logic.
 
 ## Operational Notes
 
-- This package secures message payloads at the application protocol layer.
-- You should still use TLS (`wss://`) in production for transport confidentiality and endpoint authentication.
-- Rate limiting, authentication, and authorization are complementary controls and should be implemented at gateway/service boundaries.
-
-## Roadmap
-
-- Key rotation and re-key policies
-- Replay protection primitives
-- AAD binding options for stronger protocol context integrity
-- Optional observability hooks with secure redaction defaults
+- Use `wss://` in production (transport confidentiality + endpoint authentication).
+- Application-layer encryption in `aegis-fluxion` complements TLS; it does not replace infrastructure security.
+- Add authentication, authorization, and rate limiting at the edge/service layer.
 
 ## License
 
-This repository currently does not define a license file.
-Add a `LICENSE` (for example MIT, Apache-2.0, or proprietary terms) before publishing publicly.
+MIT License.

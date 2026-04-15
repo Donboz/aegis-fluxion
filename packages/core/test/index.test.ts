@@ -234,4 +234,128 @@ describe("SecureServer and SecureClient encryption flow", () => {
       await wait(30);
     }
   });
+
+  it("supports secure room join/leave and room-scoped encrypted emits", async () => {
+    const port = await getFreePort();
+    const server = new SecureServer({ port, host: "127.0.0.1" });
+    const clientA = new SecureClient(`ws://127.0.0.1:${port}`);
+    const clientB = new SecureClient(`ws://127.0.0.1:${port}`);
+
+    try {
+      const readySockets: Array<{
+        id: string;
+        join: (room: string) => boolean;
+        leave: (room: string) => boolean;
+      }> = [];
+
+      const serverReadyPromise = withTimeout(
+        new Promise<void>((resolve) => {
+          server.on("ready", (socket) => {
+            readySockets.push(socket);
+
+            if (readySockets.length === 2) {
+              resolve();
+            }
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "both server sockets ready"
+      );
+
+      const clientReadyPromiseA = withTimeout(
+        new Promise<void>((resolve) => {
+          clientA.on("ready", () => {
+            resolve();
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "client A ready event"
+      );
+
+      const clientReadyPromiseB = withTimeout(
+        new Promise<void>((resolve) => {
+          clientB.on("ready", () => {
+            resolve();
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "client B ready event"
+      );
+
+      await Promise.all([
+        serverReadyPromise,
+        clientReadyPromiseA,
+        clientReadyPromiseB
+      ]);
+
+      const [socketA, socketB] = readySockets;
+
+      expect(socketA.join("agents:secure")).toBe(true);
+      expect(socketA.join("agents:secure")).toBe(false);
+      expect(socketB.join("agents:secure")).toBe(true);
+      expect(socketB.leave("agents:secure")).toBe(true);
+      expect(socketB.leave("agents:secure")).toBe(false);
+
+      let didClientBReceiveRoomMessage = false;
+      clientB.on("room:message", () => {
+        didClientBReceiveRoomMessage = true;
+      });
+
+      const roomMessagePromiseA = withTimeout(
+        new Promise<unknown>((resolve) => {
+          clientA.on("room:message", (payload) => {
+            resolve(payload);
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "room message for client A"
+      );
+
+      server.to("agents:secure").emit("room:message", {
+        source: "server",
+        secure: true
+      });
+
+      const roomPayloadA = await roomMessagePromiseA;
+
+      expect(roomPayloadA).toEqual({
+        source: "server",
+        secure: true
+      });
+
+      await wait(120);
+      expect(didClientBReceiveRoomMessage).toBe(false);
+
+      const directMessagePromiseB = withTimeout(
+        new Promise<unknown>((resolve) => {
+          clientB.on("direct:message", (payload) => {
+            resolve(payload);
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "direct message for client B"
+      );
+
+      expect(
+        server.emitTo(socketB.id, "direct:message", {
+          source: "server",
+          secure: true
+        })
+      ).toBe(true);
+
+      const directPayloadB = await directMessagePromiseB;
+
+      expect(directPayloadB).toEqual({
+        source: "server",
+        secure: true
+      });
+      expect(clientA.isConnected()).toBe(true);
+      expect(clientB.isConnected()).toBe(true);
+    } finally {
+      clientA.disconnect();
+      clientB.disconnect();
+      server.close();
+      await wait(30);
+    }
+  });
 });

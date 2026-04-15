@@ -16,6 +16,12 @@ interface SecureServerClient {
     id: string;
     socket: WebSocket;
     request: IncomingMessage;
+    join: (room: string) => boolean;
+    leave: (room: string) => boolean;
+    leaveAll: () => number;
+}
+interface SecureServerRoomOperator {
+    emit: (event: string, data: unknown) => SecureServer;
 }
 type SecureErrorHandler = (error: Error) => void;
 type SecureServerEventHandler = (data: unknown, client: SecureServerClient) => void;
@@ -53,6 +59,8 @@ declare class SecureServer {
     private readonly sharedSecretBySocket;
     private readonly encryptionKeyBySocket;
     private readonly pendingPayloadsBySocket;
+    private readonly roomMembersByName;
+    private readonly roomNamesByClientId;
     constructor(options: SecureServerOptions);
     get clientCount(): number;
     get clients(): ReadonlyMap<string, SecureServerClient>;
@@ -68,6 +76,7 @@ declare class SecureServer {
     off(event: string, handler: SecureServerEventHandler): this;
     emit(event: string, data: unknown): this;
     emitTo(clientId: string, event: string, data: unknown): boolean;
+    to(room: string): SecureServerRoomOperator;
     close(code?: number, reason?: string): void;
     private bindSocketServerEvents;
     private handleConnection;
@@ -86,6 +95,12 @@ declare class SecureServer {
     private sendOrQueuePayload;
     private queuePayload;
     private flushQueuedPayloads;
+    private createSecureServerClient;
+    private normalizeRoomName;
+    private joinClientToRoom;
+    private leaveClientFromRoom;
+    private leaveClientFromAllRooms;
+    private emitToRoom;
 }
 declare class SecureClient {
     private readonly url;
@@ -130,4 +145,4 @@ declare class SecureClient {
     private flushPendingPayloadQueue;
 }
 
-export { SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureEnvelope, type SecureErrorHandler, SecureServer, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerLifecycleEvent, type SecureServerOptions, type SecureServerReadyHandler };
+export { SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureEnvelope, type SecureErrorHandler, SecureServer, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerLifecycleEvent, type SecureServerOptions, type SecureServerReadyHandler, type SecureServerRoomOperator };

@@ -171,6 +171,8 @@ var SecureServer = class {
   sharedSecretBySocket = /* @__PURE__ */ new WeakMap();
   encryptionKeyBySocket = /* @__PURE__ */ new WeakMap();
   pendingPayloadsBySocket = /* @__PURE__ */ new WeakMap();
+  roomMembersByName = /* @__PURE__ */ new Map();
+  roomNamesByClientId = /* @__PURE__ */ new Map();
   constructor(options) {
     this.socketServer = new WebSocketServer(options);
     this.bindSocketServerEvents();
@@ -279,6 +281,21 @@ var SecureServer = class {
       return false;
     }
   }
+  to(room) {
+    const normalizedRoom = this.normalizeRoomName(room);
+    return {
+      emit: (event, data) => {
+        try {
+          this.emitToRoom(normalizedRoom, event, data);
+        } catch (error) {
+          this.notifyError(
+            normalizeToError(error, `Failed to emit event to room ${normalizedRoom}.`)
+          );
+        }
+        return this;
+      }
+    };
+  }
   close(code = DEFAULT_CLOSE_CODE, reason = DEFAULT_CLOSE_REASON) {
     try {
       for (const client of this.clientsById.values()) {
@@ -303,15 +320,12 @@ var SecureServer = class {
     try {
       const clientId = randomUUID();
       const handshakeState = this.createServerHandshakeState();
-      const client = {
-        id: clientId,
-        socket,
-        request
-      };
+      const client = this.createSecureServerClient(clientId, socket, request);
       this.clientsById.set(clientId, client);
       this.clientIdBySocket.set(socket, clientId);
       this.handshakeStateBySocket.set(socket, handshakeState);
       this.pendingPayloadsBySocket.set(socket, []);
+      this.roomNamesByClientId.set(clientId, /* @__PURE__ */ new Set());
       socket.on("message", (rawData) => {
         this.handleIncomingMessage(client, rawData);
       });
@@ -378,6 +392,7 @@ var SecureServer = class {
   }
   handleDisconnection(client, code, reason) {
     try {
+      client.leaveAll();
       this.clientsById.delete(client.id);
       this.clientIdBySocket.delete(client.socket);
       this.handshakeStateBySocket.delete(client.socket);
@@ -541,6 +556,98 @@ var SecureServer = class {
     this.pendingPayloadsBySocket.delete(socket);
     for (const envelope of pendingPayloads) {
       this.sendEncryptedEnvelope(socket, envelope);
+    }
+  }
+  createSecureServerClient(clientId, socket, request) {
+    return {
+      id: clientId,
+      socket,
+      request,
+      join: (room) => this.joinClientToRoom(clientId, room),
+      leave: (room) => this.leaveClientFromRoom(clientId, room),
+      leaveAll: () => this.leaveClientFromAllRooms(clientId)
+    };
+  }
+  normalizeRoomName(room) {
+    if (typeof room !== "string") {
+      throw new Error("Room name must be a string.");
+    }
+    const normalizedRoom = room.trim();
+    if (normalizedRoom.length === 0) {
+      throw new Error("Room name cannot be empty.");
+    }
+    return normalizedRoom;
+  }
+  joinClientToRoom(clientId, room) {
+    const normalizedRoom = this.normalizeRoomName(room);
+    if (!this.clientsById.has(clientId)) {
+      return false;
+    }
+    const clientRooms = this.roomNamesByClientId.get(clientId) ?? /* @__PURE__ */ new Set();
+    if (clientRooms.has(normalizedRoom)) {
+      this.roomNamesByClientId.set(clientId, clientRooms);
+      return false;
+    }
+    clientRooms.add(normalizedRoom);
+    this.roomNamesByClientId.set(clientId, clientRooms);
+    const roomMembers = this.roomMembersByName.get(normalizedRoom) ?? /* @__PURE__ */ new Set();
+    roomMembers.add(clientId);
+    this.roomMembersByName.set(normalizedRoom, roomMembers);
+    return true;
+  }
+  leaveClientFromRoom(clientId, room) {
+    const normalizedRoom = this.normalizeRoomName(room);
+    const clientRooms = this.roomNamesByClientId.get(clientId);
+    if (!clientRooms || !clientRooms.delete(normalizedRoom)) {
+      return false;
+    }
+    if (clientRooms.size === 0) {
+      this.roomNamesByClientId.delete(clientId);
+    }
+    const roomMembers = this.roomMembersByName.get(normalizedRoom);
+    if (roomMembers) {
+      roomMembers.delete(clientId);
+      if (roomMembers.size === 0) {
+        this.roomMembersByName.delete(normalizedRoom);
+      }
+    }
+    return true;
+  }
+  leaveClientFromAllRooms(clientId) {
+    const clientRooms = this.roomNamesByClientId.get(clientId);
+    if (!clientRooms || clientRooms.size === 0) {
+      this.roomNamesByClientId.delete(clientId);
+      return 0;
+    }
+    const roomNames = [...clientRooms];
+    this.roomNamesByClientId.delete(clientId);
+    for (const roomName of roomNames) {
+      const roomMembers = this.roomMembersByName.get(roomName);
+      if (!roomMembers) {
+        continue;
+      }
+      roomMembers.delete(clientId);
+      if (roomMembers.size === 0) {
+        this.roomMembersByName.delete(roomName);
+      }
+    }
+    return roomNames.length;
+  }
+  emitToRoom(room, event, data) {
+    if (isReservedEmitEvent(event)) {
+      throw new Error(`The event "${event}" is reserved and cannot be emitted manually.`);
+    }
+    const roomMembers = this.roomMembersByName.get(room);
+    if (!roomMembers || roomMembers.size === 0) {
+      return;
+    }
+    const envelope = { event, data };
+    for (const clientId of roomMembers) {
+      const client = this.clientsById.get(clientId);
+      if (!client) {
+        continue;
+      }
+      this.sendOrQueuePayload(client.socket, envelope);
     }
   }
 };
