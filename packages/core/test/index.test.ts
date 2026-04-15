@@ -1132,4 +1132,144 @@ describe("SecureServer and SecureClient encryption flow", () => {
       await wait(30);
     }
   });
+
+  it("throttles burst traffic and drops messages while throttle window is active", async () => {
+    const port = await getFreePort();
+    const server = new SecureServer({
+      port,
+      host: "127.0.0.1",
+      rateLimit: {
+        enabled: true,
+        windowMs: 1_000,
+        maxEventsPerConnection: 1,
+        maxEventsPerIp: 2,
+        action: "throttle",
+        throttleMs: 80,
+        maxThrottleMs: 80,
+        disconnectAfterViolations: 10
+      }
+    });
+    const client = new SecureClient(`ws://127.0.0.1:${port}`, {
+      reconnect: false
+    });
+
+    const processedEvents: number[] = [];
+
+    server.on("burst:probe", (payload) => {
+      const parsedPayload = payload as { sequence: number };
+      processedEvents.push(parsedPayload.sequence);
+    });
+
+    try {
+      await Promise.all([
+        withTimeout(
+          new Promise<void>((resolve) => {
+            server.on("ready", () => {
+              resolve();
+            });
+          }),
+          TEST_TIMEOUT_MS,
+          "server ready for throttle test"
+        ),
+        withTimeout(
+          new Promise<void>((resolve) => {
+            client.on("ready", () => {
+              resolve();
+            });
+          }),
+          TEST_TIMEOUT_MS,
+          "client ready for throttle test"
+        )
+      ]);
+
+      expect(client.emit("burst:probe", { sequence: 1 })).toBe(true);
+      expect(client.emit("burst:probe", { sequence: 2 })).toBe(true);
+      expect(client.emit("burst:probe", { sequence: 3 })).toBe(true);
+
+      await wait(250);
+
+      expect(processedEvents.length).toBeGreaterThanOrEqual(1);
+      expect(processedEvents.length).toBeLessThanOrEqual(2);
+      expect(processedEvents[0]).toBe(1);
+      expect(processedEvents).not.toContain(3);
+      expect(client.isConnected()).toBe(true);
+    } finally {
+      client.disconnect();
+      server.close();
+      await wait(30);
+    }
+  });
+
+  it("disconnects flooded clients when rate limiter action is set to disconnect", async () => {
+    const port = await getFreePort();
+    const server = new SecureServer({
+      port,
+      host: "127.0.0.1",
+      rateLimit: {
+        enabled: true,
+        windowMs: 1_000,
+        maxEventsPerConnection: 1,
+        maxEventsPerIp: 1,
+        action: "disconnect",
+        disconnectAfterViolations: 1,
+        disconnectCode: 1013,
+        disconnectReason: "Rate limit exceeded. Please retry later."
+      }
+    });
+    const client = new SecureClient(`ws://127.0.0.1:${port}`, {
+      reconnect: false
+    });
+
+    server.on("burst:disconnect", () => {
+      return undefined;
+    });
+
+    try {
+      await Promise.all([
+        withTimeout(
+          new Promise<void>((resolve) => {
+            server.on("ready", () => {
+              resolve();
+            });
+          }),
+          TEST_TIMEOUT_MS,
+          "server ready for disconnect throttle test"
+        ),
+        withTimeout(
+          new Promise<void>((resolve) => {
+            client.on("ready", () => {
+              resolve();
+            });
+          }),
+          TEST_TIMEOUT_MS,
+          "client ready for disconnect throttle test"
+        )
+      ]);
+
+      const disconnectPromise = withTimeout(
+        new Promise<{ code: number; reason: string }>((resolve) => {
+          client.on("disconnect", (code, reason) => {
+            resolve({ code, reason });
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "disconnect after rate limit"
+      );
+
+      expect(client.emit("burst:disconnect", { step: 1 })).toBe(true);
+      expect(client.emit("burst:disconnect", { step: 2 })).toBe(true);
+
+      const disconnectPayload = await disconnectPromise;
+
+      expect(disconnectPayload.code).toBe(1013);
+      expect(disconnectPayload.reason).toMatch(/rate limit exceeded/i);
+
+      await wait(50);
+      expect(server.clientCount).toBe(0);
+    } finally {
+      client.disconnect();
+      server.close();
+      await wait(30);
+    }
+  });
 });

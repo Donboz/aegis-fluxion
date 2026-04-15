@@ -7,6 +7,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-04-15
+
+### Added
+
+- `SecureServer` now supports configurable rate limiting and DDoS shielding with per-connection and per-IP counters.
+- New server options for overload protection:
+  - `rateLimit.maxEventsPerConnection`
+  - `rateLimit.maxEventsPerIp`
+  - `rateLimit.action` (`"throttle" | "disconnect"`)
+  - `rateLimit.throttleMs`, `rateLimit.maxThrottleMs`
+  - `rateLimit.disconnectAfterViolations`, `rateLimit.disconnectCode`, `rateLimit.disconnectReason`
+- Integration tests validating burst throttling/drop behavior and disconnect enforcement under flood conditions.
+
+### Changed
+
+- `@aegis-fluxion/core` bumped to `0.7.1`.
+- `aegis-fluxion` (umbrella package) patch-bumped to `0.7.1` and now depends on `@aegis-fluxion/core@^0.7.1`.
+- Versioning policy aligned to independent package releases, with umbrella patch bumps reflecting updated internals.
+
+### Security
+
+- Added server-side burst protection to slow or disconnect abusive peers before custom event handlers execute.
+- Rate limiting is enforced for encrypted message ingress to reduce flood amplification and protect runtime stability.
+
 ## [0.7.0] - 2026-04-15
 
 ### Added

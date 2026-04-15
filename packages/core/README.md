@@ -4,7 +4,7 @@ Low-level E2E-encrypted WebSocket primitives for the `aegis-fluxion` ecosystem.
 
 If you prefer a single user-facing package, use [`aegis-fluxion`](../aegis-fluxion/README.md).
 
-Version: **0.7.0**
+Version: **0.7.1**
 
 ---
 
@@ -20,6 +20,7 @@ Version: **0.7.0**
 - **Server middleware pipeline** via `SecureServer.use(...)`
 - Middleware phases: `connection`, `incoming`, `outgoing`
 - Per-socket middleware metadata available as `SecureServerClient.metadata`
+- **Rate limiting & DDoS shield** with per-connection/per-IP controls
 - Optional MCP bridge package: `@aegis-fluxion/mcp-adapter`
 
 ---
@@ -104,6 +105,40 @@ Notes:
 
 - Throwing in `connection` middleware rejects the socket and closes with code `1008`.
 - `metadata` is mutable in middleware (`Map`) and exposed read-only on `SecureServerClient`.
+
+---
+
+## Rate Limiting & DDoS Protection (0.7.1)
+
+`SecureServer` can enforce burst limits per connection and per source IP before event handlers run.
+
+```ts
+import { SecureServer } from "@aegis-fluxion/core";
+
+const server = new SecureServer({
+  host: "127.0.0.1",
+  port: 8080,
+  rateLimit: {
+    enabled: true,
+    windowMs: 1_000,
+    maxEventsPerConnection: 120,
+    maxEventsPerIp: 300,
+    action: "throttle",
+    throttleMs: 150,
+    maxThrottleMs: 2_000,
+    disconnectAfterViolations: 4,
+    disconnectCode: 1013,
+    disconnectReason: "Rate limit exceeded. Please retry later."
+  }
+});
+```
+
+Behavior summary:
+
+- When limits are exceeded, the server can **throttle** or **disconnect** the peer.
+- Throttle mode delays the first over-limit message and drops subsequent flood packets during the throttle window.
+- Disconnect mode closes abusive sockets with your configured close code/reason.
+- Source IP is resolved from `x-forwarded-for` (first hop) or socket remote address.
 
 ---
 
@@ -265,6 +300,8 @@ client.on("ready", async () => {
 - `SecureServerConnectionMiddlewareContext`
 - `SecureServerMessageMiddlewareContext`
 - `SecureServerMiddlewareNext`
+- `SecureServerRateLimitOptions`
+- `SecureServerRateLimitAction`
 
 ### `SecureClient`
 
@@ -287,6 +324,7 @@ client.on("ready", async () => {
 - Authentication tags are verified on every packet (tampered packets are dropped).
 - Internal transport events are reserved (`__handshake`, `__rpc:req`, `__rpc:res`).
 - Pending ACK requests are rejected on timeout/disconnect.
+- Overload traffic can be throttled or disconnected before custom handlers are invoked.
 - Middleware-level policy rejection uses WebSocket close code `1008`.
 
 ---

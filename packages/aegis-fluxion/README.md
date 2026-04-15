@@ -5,7 +5,7 @@ Main end-user package for the `aegis-fluxion` secure messaging toolkit.
 This package re-exports the full public API from `@aegis-fluxion/core`, including
 `SecureServer`, `SecureClient`, and all related types.
 
-Version: **0.7.0**
+Version: **0.7.1**
 
 ---
 
@@ -26,6 +26,7 @@ npm install aegis-fluxion ws
 - **Binary support out of the box** (`Buffer`, `Uint8Array`, `Blob`)
 - **Middleware auth and policy hooks** (`connection` / `incoming` / `outgoing`)
 - Per-client metadata pipeline via `client.metadata`
+- **Rate limiting and DDoS shield** (per-connection + per-IP)
 - **MCP transport adapter** (`SecureMCPTransport`) for JSON-RPC over encrypted WebSocket
 
 ---
@@ -114,6 +115,39 @@ client.on("ready", async () => {
 - Unauthorized sockets are closed with policy code `1008`.
 - `incoming` and `outgoing` middleware can transform event names/payloads.
 - Metadata set during middleware is available later through `client.metadata`.
+
+---
+
+## Rate Limiting & DDoS Shield
+
+The umbrella package includes `SecureServer` rate limiting controls from `@aegis-fluxion/core`.
+
+```ts
+import { SecureServer } from "aegis-fluxion";
+
+const server = new SecureServer({
+  host: "127.0.0.1",
+  port: 8080,
+  rateLimit: {
+    enabled: true,
+    windowMs: 1_000,
+    maxEventsPerConnection: 120,
+    maxEventsPerIp: 300,
+    action: "throttle", // or "disconnect"
+    throttleMs: 150,
+    maxThrottleMs: 2_000,
+    disconnectAfterViolations: 4,
+    disconnectCode: 1013,
+    disconnectReason: "Rate limit exceeded. Please retry later."
+  }
+});
+```
+
+Protection behavior:
+
+- Over-limit bursts are delayed and then selectively dropped during active throttle windows.
+- Persistent abuse can trigger server-side disconnect with configurable close code/reason.
+- Limits are evaluated per connection and per resolved source IP.
 
 ---
 

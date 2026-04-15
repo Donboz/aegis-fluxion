@@ -1,6 +1,6 @@
 # aegis-fluxion
 
-![Version](https://img.shields.io/badge/version-0.7.0-2563eb)
+![Version](https://img.shields.io/badge/version-0.7.1-2563eb)
 ![Node](https://img.shields.io/badge/node-%3E%3D18.18.0-16a34a)
 ![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178c6)
 ![Crypto](https://img.shields.io/badge/Crypto-ECDH%20%2B%20AES--256--GCM-0f172a)
@@ -24,7 +24,14 @@ transformation, and MCP (Model Context Protocol) transport adaptation.
 
 ---
 
-## What's New in 0.7.0
+## What's New in 0.7.1
+
+- `SecureServer` now includes a configurable **Rate Limiting & DDoS Protection** shield.
+- Burst control can be applied per connection and per source IP before custom handlers run.
+- Overload policy supports both **throttling** and **disconnect** actions with configurable thresholds.
+- Added integration tests for flood handling, throttle windows, and forced disconnect enforcement.
+
+### Prior 0.7.0 highlights
 
 - New `@aegis-fluxion/mcp-adapter` package
 - `SecureMCPTransport` to carry MCP JSON-RPC traffic over encrypted channels

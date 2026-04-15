@@ -15,8 +15,22 @@ interface SecureServerHeartbeatOptions {
     intervalMs?: number;
     timeoutMs?: number;
 }
+type SecureServerRateLimitAction = "throttle" | "disconnect";
+interface SecureServerRateLimitOptions {
+    enabled?: boolean;
+    windowMs?: number;
+    maxEventsPerConnection?: number;
+    maxEventsPerIp?: number;
+    action?: SecureServerRateLimitAction;
+    throttleMs?: number;
+    maxThrottleMs?: number;
+    disconnectAfterViolations?: number;
+    disconnectCode?: number;
+    disconnectReason?: string;
+}
 interface SecureServerOptions extends ServerOptions {
     heartbeat?: SecureServerHeartbeatOptions;
+    rateLimit?: SecureServerRateLimitOptions;
 }
 interface SecureClientReconnectOptions {
     enabled?: boolean;
@@ -87,6 +101,7 @@ type SecureServerMiddleware = (context: SecureServerMiddlewareContext, next: Sec
 declare class SecureServer {
     private readonly socketServer;
     private readonly heartbeatConfig;
+    private readonly rateLimitConfig;
     private heartbeatIntervalHandle;
     private readonly clientsById;
     private readonly clientIdBySocket;
@@ -105,6 +120,9 @@ declare class SecureServer {
     private readonly heartbeatStateBySocket;
     private readonly roomMembersByName;
     private readonly roomNamesByClientId;
+    private readonly clientIpByClientId;
+    private readonly rateLimitBucketsByClientId;
+    private readonly rateLimitBucketsByIp;
     constructor(options: SecureServerOptions);
     get clientCount(): number;
     get clients(): ReadonlyMap<string, SecureServerClient>;
@@ -127,6 +145,16 @@ declare class SecureServer {
     to(room: string): SecureServerRoomOperator;
     close(code?: number, reason?: string): void;
     private resolveHeartbeatConfig;
+    private resolveRateLimitConfig;
+    private createRateLimitBucket;
+    private getOrCreateRateLimitBucket;
+    private updateRateLimitBucket;
+    private pruneRateLimitBucketMap;
+    private pruneRateLimitBuckets;
+    private normalizeIpAddress;
+    private resolveClientIp;
+    private isIpStillConnected;
+    private evaluateIncomingRateLimit;
     private startHeartbeatLoop;
     private stopHeartbeatLoop;
     private performHeartbeatSweep;
@@ -223,4 +251,4 @@ declare class SecureClient {
     private flushPendingPayloadQueue;
 }
 
-export { type SecureAckCallback, type SecureAckOptions, type SecureBinaryPayload, SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureClientReconnectOptions, type SecureEnvelope, type SecureErrorHandler, SecureServer, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerConnectionMiddlewareContext, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerHeartbeatOptions, type SecureServerLifecycleEvent, type SecureServerMessageMiddlewareContext, type SecureServerMiddleware, type SecureServerMiddlewareContext, type SecureServerMiddlewareNext, type SecureServerOptions, type SecureServerReadyHandler, type SecureServerRoomOperator };
+export { type SecureAckCallback, type SecureAckOptions, type SecureBinaryPayload, SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureClientReconnectOptions, type SecureEnvelope, type SecureErrorHandler, SecureServer, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerConnectionMiddlewareContext, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerHeartbeatOptions, type SecureServerLifecycleEvent, type SecureServerMessageMiddlewareContext, type SecureServerMiddleware, type SecureServerMiddlewareContext, type SecureServerMiddlewareNext, type SecureServerOptions, type SecureServerRateLimitAction, type SecureServerRateLimitOptions, type SecureServerReadyHandler, type SecureServerRoomOperator };

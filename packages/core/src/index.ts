@@ -39,6 +39,15 @@ const DEFAULT_RECONNECT_MAX_DELAY_MS = 10_000;
 const DEFAULT_RECONNECT_FACTOR = 2;
 const DEFAULT_RECONNECT_JITTER_RATIO = 0.2;
 const DEFAULT_RPC_TIMEOUT_MS = 5_000;
+const DEFAULT_RATE_LIMIT_WINDOW_MS = 1_000;
+const DEFAULT_RATE_LIMIT_MAX_EVENTS_PER_CONNECTION = 120;
+const DEFAULT_RATE_LIMIT_MAX_EVENTS_PER_IP = 300;
+const DEFAULT_RATE_LIMIT_THROTTLE_MS = 150;
+const DEFAULT_RATE_LIMIT_MAX_THROTTLE_MS = 2_000;
+const DEFAULT_RATE_LIMIT_DISCONNECT_AFTER_VIOLATIONS = 4;
+const DEFAULT_RATE_LIMIT_CLOSE_CODE = 1013;
+const DEFAULT_RATE_LIMIT_CLOSE_REASON =
+  "Rate limit exceeded. Please retry later.";
 
 interface HandshakePayload {
   publicKey: string;
@@ -83,6 +92,20 @@ interface PendingRpcRequest {
   timeoutHandle: ReturnType<typeof setTimeout>;
 }
 
+interface SecureServerRateLimitBucket {
+  windowStartedAt: number;
+  count: number;
+  violationCount: number;
+  throttleUntil: number;
+  lastSeenAt: number;
+}
+
+interface SecureServerRateLimitDecision {
+  shouldDisconnect: boolean;
+  shouldDrop: boolean;
+  throttleDelayMs: number;
+}
+
 type BinaryPayloadKind = "buffer" | "uint8array" | "blob";
 
 interface EncodedBinaryPayload {
@@ -114,8 +137,24 @@ export interface SecureServerHeartbeatOptions {
   timeoutMs?: number;
 }
 
+export type SecureServerRateLimitAction = "throttle" | "disconnect";
+
+export interface SecureServerRateLimitOptions {
+  enabled?: boolean;
+  windowMs?: number;
+  maxEventsPerConnection?: number;
+  maxEventsPerIp?: number;
+  action?: SecureServerRateLimitAction;
+  throttleMs?: number;
+  maxThrottleMs?: number;
+  disconnectAfterViolations?: number;
+  disconnectCode?: number;
+  disconnectReason?: string;
+}
+
 export interface SecureServerOptions extends WebSocketServerOptions {
   heartbeat?: SecureServerHeartbeatOptions;
+  rateLimit?: SecureServerRateLimitOptions;
 }
 
 export interface SecureClientReconnectOptions {
@@ -278,6 +317,12 @@ function rawDataToBuffer(rawData: RawData): Buffer {
   }
 
   return Buffer.from(rawData);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function isBlobValue(value: unknown): value is Blob {
@@ -687,6 +732,8 @@ export class SecureServer {
 
   private readonly heartbeatConfig: Required<SecureServerHeartbeatOptions>;
 
+  private readonly rateLimitConfig: Required<SecureServerRateLimitOptions>;
+
   private heartbeatIntervalHandle: ReturnType<typeof setInterval> | null = null;
 
   private readonly clientsById = new Map<string, SecureServerClient>();
@@ -732,10 +779,23 @@ export class SecureServer {
 
   private readonly roomNamesByClientId = new Map<string, Set<string>>();
 
+  private readonly clientIpByClientId = new Map<string, string>();
+
+  private readonly rateLimitBucketsByClientId = new Map<
+    string,
+    SecureServerRateLimitBucket
+  >();
+
+  private readonly rateLimitBucketsByIp = new Map<
+    string,
+    SecureServerRateLimitBucket
+  >();
+
   public constructor(options: SecureServerOptions) {
-    const { heartbeat, ...socketServerOptions } = options;
+    const { heartbeat, rateLimit, ...socketServerOptions } = options;
 
     this.heartbeatConfig = this.resolveHeartbeatConfig(heartbeat);
+    this.rateLimitConfig = this.resolveRateLimitConfig(rateLimit);
     this.socketServer = new WebSocketServer(socketServerOptions);
     this.bindSocketServerEvents();
     this.startHeartbeatLoop();
@@ -1006,6 +1066,10 @@ export class SecureServer {
         }
       }
 
+      this.rateLimitBucketsByClientId.clear();
+      this.rateLimitBucketsByIp.clear();
+      this.clientIpByClientId.clear();
+
       this.socketServer.close();
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to close server."));
@@ -1030,6 +1094,300 @@ export class SecureServer {
       enabled: heartbeatOptions?.enabled ?? true,
       intervalMs,
       timeoutMs
+    };
+  }
+
+  private resolveRateLimitConfig(
+    rateLimitOptions: SecureServerRateLimitOptions | undefined
+  ): Required<SecureServerRateLimitOptions> {
+    const windowMs = rateLimitOptions?.windowMs ?? DEFAULT_RATE_LIMIT_WINDOW_MS;
+    const maxEventsPerConnection =
+      rateLimitOptions?.maxEventsPerConnection ??
+      DEFAULT_RATE_LIMIT_MAX_EVENTS_PER_CONNECTION;
+    const maxEventsPerIp =
+      rateLimitOptions?.maxEventsPerIp ?? DEFAULT_RATE_LIMIT_MAX_EVENTS_PER_IP;
+    const action = rateLimitOptions?.action ?? "throttle";
+    const throttleMs = rateLimitOptions?.throttleMs ?? DEFAULT_RATE_LIMIT_THROTTLE_MS;
+    const maxThrottleMs =
+      rateLimitOptions?.maxThrottleMs ?? DEFAULT_RATE_LIMIT_MAX_THROTTLE_MS;
+    const disconnectAfterViolations =
+      rateLimitOptions?.disconnectAfterViolations ??
+      DEFAULT_RATE_LIMIT_DISCONNECT_AFTER_VIOLATIONS;
+    const disconnectCode =
+      rateLimitOptions?.disconnectCode ?? DEFAULT_RATE_LIMIT_CLOSE_CODE;
+    const disconnectReason =
+      rateLimitOptions?.disconnectReason ?? DEFAULT_RATE_LIMIT_CLOSE_REASON;
+
+    if (!Number.isFinite(windowMs) || windowMs <= 0) {
+      throw new Error("Server rateLimit windowMs must be a positive number.");
+    }
+
+    if (!Number.isFinite(maxEventsPerConnection) || maxEventsPerConnection <= 0) {
+      throw new Error(
+        "Server rateLimit maxEventsPerConnection must be a positive number."
+      );
+    }
+
+    if (!Number.isFinite(maxEventsPerIp) || maxEventsPerIp <= 0) {
+      throw new Error("Server rateLimit maxEventsPerIp must be a positive number.");
+    }
+
+    if (action !== "throttle" && action !== "disconnect") {
+      throw new Error('Server rateLimit action must be either "throttle" or "disconnect".');
+    }
+
+    if (!Number.isFinite(throttleMs) || throttleMs <= 0) {
+      throw new Error("Server rateLimit throttleMs must be a positive number.");
+    }
+
+    if (!Number.isFinite(maxThrottleMs) || maxThrottleMs <= 0) {
+      throw new Error("Server rateLimit maxThrottleMs must be a positive number.");
+    }
+
+    if (maxThrottleMs < throttleMs) {
+      throw new Error(
+        "Server rateLimit maxThrottleMs must be greater than or equal to throttleMs."
+      );
+    }
+
+    if (
+      !Number.isInteger(disconnectAfterViolations) ||
+      disconnectAfterViolations <= 0
+    ) {
+      throw new Error(
+        "Server rateLimit disconnectAfterViolations must be a positive integer."
+      );
+    }
+
+    if (!Number.isInteger(disconnectCode) || disconnectCode < 1000 || disconnectCode > 4999) {
+      throw new Error("Server rateLimit disconnectCode must be a valid WebSocket close code.");
+    }
+
+    return {
+      enabled: rateLimitOptions?.enabled ?? true,
+      windowMs,
+      maxEventsPerConnection,
+      maxEventsPerIp,
+      action,
+      throttleMs,
+      maxThrottleMs,
+      disconnectAfterViolations,
+      disconnectCode,
+      disconnectReason
+    };
+  }
+
+  private createRateLimitBucket(now: number): SecureServerRateLimitBucket {
+    return {
+      windowStartedAt: now,
+      count: 0,
+      violationCount: 0,
+      throttleUntil: 0,
+      lastSeenAt: now
+    };
+  }
+
+  private getOrCreateRateLimitBucket(
+    map: Map<string, SecureServerRateLimitBucket>,
+    key: string,
+    now: number
+  ): SecureServerRateLimitBucket {
+    const existingBucket = map.get(key);
+
+    if (existingBucket) {
+      return existingBucket;
+    }
+
+    const bucket = this.createRateLimitBucket(now);
+    map.set(key, bucket);
+    return bucket;
+  }
+
+  private updateRateLimitBucket(bucket: SecureServerRateLimitBucket, now: number): void {
+    if (now - bucket.windowStartedAt >= this.rateLimitConfig.windowMs) {
+      bucket.windowStartedAt = now;
+      bucket.count = 0;
+      bucket.violationCount = 0;
+      bucket.throttleUntil = 0;
+    }
+
+    bucket.count += 1;
+    bucket.lastSeenAt = now;
+  }
+
+  private pruneRateLimitBucketMap(
+    map: Map<string, SecureServerRateLimitBucket>,
+    now: number,
+    maxIdleMs: number
+  ): void {
+    for (const [key, bucket] of map.entries()) {
+      if (now - bucket.lastSeenAt >= maxIdleMs) {
+        map.delete(key);
+      }
+    }
+  }
+
+  private pruneRateLimitBuckets(now: number): void {
+    const maxIdleMs = this.rateLimitConfig.windowMs * 4;
+    this.pruneRateLimitBucketMap(this.rateLimitBucketsByClientId, now, maxIdleMs);
+    this.pruneRateLimitBucketMap(this.rateLimitBucketsByIp, now, maxIdleMs);
+  }
+
+  private normalizeIpAddress(ipAddress: string): string {
+    let normalized = ipAddress.trim().toLowerCase();
+
+    if (normalized.startsWith("::ffff:")) {
+      normalized = normalized.slice(7);
+    }
+
+    if (normalized.startsWith("[") && normalized.endsWith("]")) {
+      normalized = normalized.slice(1, -1);
+    }
+
+    const zoneIndex = normalized.indexOf("%");
+
+    if (zoneIndex >= 0) {
+      normalized = normalized.slice(0, zoneIndex);
+    }
+
+    return normalized.length > 0 ? normalized : "unknown";
+  }
+
+  private resolveClientIp(request: IncomingMessage): string {
+    const forwardedHeader = request.headers["x-forwarded-for"];
+    const forwardedValue = Array.isArray(forwardedHeader)
+      ? forwardedHeader[0]
+      : forwardedHeader;
+
+    if (typeof forwardedValue === "string") {
+      const firstForwardedIp = forwardedValue
+        .split(",")
+        .map((item) => item.trim())
+        .find((item) => item.length > 0);
+
+      if (firstForwardedIp) {
+        return this.normalizeIpAddress(firstForwardedIp);
+      }
+    }
+
+    return this.normalizeIpAddress(request.socket.remoteAddress ?? "unknown");
+  }
+
+  private isIpStillConnected(ipAddress: string): boolean {
+    for (const connectedIp of this.clientIpByClientId.values()) {
+      if (connectedIp === ipAddress) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private evaluateIncomingRateLimit(
+    client: SecureServerClient
+  ): SecureServerRateLimitDecision {
+    const noLimitDecision: SecureServerRateLimitDecision = {
+      shouldDisconnect: false,
+      shouldDrop: false,
+      throttleDelayMs: 0
+    };
+
+    if (!this.rateLimitConfig.enabled) {
+      return noLimitDecision;
+    }
+
+    const now = Date.now();
+    const clientBucket = this.getOrCreateRateLimitBucket(
+      this.rateLimitBucketsByClientId,
+      client.id,
+      now
+    );
+
+    this.updateRateLimitBucket(clientBucket, now);
+
+    const clientIp = this.clientIpByClientId.get(client.id);
+    const ipBucket = clientIp
+      ? this.getOrCreateRateLimitBucket(this.rateLimitBucketsByIp, clientIp, now)
+      : null;
+
+    if (ipBucket) {
+      this.updateRateLimitBucket(ipBucket, now);
+    }
+
+    const activeThrottleUntil = Math.max(
+      clientBucket.throttleUntil,
+      ipBucket?.throttleUntil ?? 0
+    );
+
+    if (activeThrottleUntil > now) {
+      return {
+        shouldDisconnect: false,
+        shouldDrop: true,
+        throttleDelayMs: 0
+      };
+    }
+
+    const isConnectionLimitExceeded =
+      clientBucket.count > this.rateLimitConfig.maxEventsPerConnection;
+    const isIpLimitExceeded = ipBucket
+      ? ipBucket.count > this.rateLimitConfig.maxEventsPerIp
+      : false;
+
+    if (!isConnectionLimitExceeded && !isIpLimitExceeded) {
+      if (
+        this.rateLimitBucketsByClientId.size > 1_024 ||
+        this.rateLimitBucketsByIp.size > 1_024
+      ) {
+        this.pruneRateLimitBuckets(now);
+      }
+
+      return noLimitDecision;
+    }
+
+    if (isConnectionLimitExceeded) {
+      clientBucket.violationCount += 1;
+    }
+
+    if (ipBucket && isIpLimitExceeded) {
+      ipBucket.violationCount += 1;
+    }
+
+    const violationCount = Math.max(
+      clientBucket.violationCount,
+      ipBucket?.violationCount ?? 0
+    );
+
+    const shouldDisconnect =
+      this.rateLimitConfig.action === "disconnect" ||
+      violationCount >= this.rateLimitConfig.disconnectAfterViolations;
+
+    if (shouldDisconnect) {
+      return {
+        shouldDisconnect: true,
+        shouldDrop: true,
+        throttleDelayMs: 0
+      };
+    }
+
+    const throttleDelayMs = Math.min(
+      this.rateLimitConfig.maxThrottleMs,
+      Math.max(
+        this.rateLimitConfig.throttleMs,
+        this.rateLimitConfig.throttleMs * violationCount
+      )
+    );
+
+    const throttleUntil = now + throttleDelayMs;
+    clientBucket.throttleUntil = throttleUntil;
+
+    if (ipBucket) {
+      ipBucket.throttleUntil = throttleUntil;
+    }
+
+    return {
+      shouldDisconnect: false,
+      shouldDrop: false,
+      throttleDelayMs
     };
   }
 
@@ -1164,6 +1522,10 @@ export class SecureServer {
     try {
       const clientId = randomUUID();
       const handshakeState = this.createServerHandshakeState();
+      const clientIp = this.resolveClientIp(request);
+
+      connectionMetadata.set("network.ip", clientIp);
+
       const client = this.createSecureServerClient(
         clientId,
         socket,
@@ -1173,6 +1535,7 @@ export class SecureServer {
 
       this.clientsById.set(clientId, client);
       this.clientIdBySocket.set(socket, clientId);
+      this.clientIpByClientId.set(clientId, clientIp);
       this.handshakeStateBySocket.set(socket, handshakeState);
       this.pendingPayloadsBySocket.set(socket, []);
       this.pendingRpcRequestsBySocket.set(socket, new Map<string, PendingRpcRequest>());
@@ -1216,6 +1579,46 @@ export class SecureServer {
     rawData: RawData
   ): Promise<void> {
     try {
+      const rateLimitDecision = this.evaluateIncomingRateLimit(client);
+
+      if (rateLimitDecision.shouldDisconnect) {
+        this.notifyError(
+          new Error(
+            `Rate limit disconnect triggered for client ${client.id}.`
+          )
+        );
+
+        if (
+          client.socket.readyState === WebSocket.OPEN ||
+          client.socket.readyState === WebSocket.CONNECTING
+        ) {
+          client.socket.close(
+            this.rateLimitConfig.disconnectCode,
+            this.rateLimitConfig.disconnectReason
+          );
+        }
+
+        return;
+      }
+
+      if (rateLimitDecision.shouldDrop) {
+        return;
+      }
+
+      if (rateLimitDecision.throttleDelayMs > 0) {
+        this.notifyError(
+          new Error(
+            `Rate limit throttle applied to client ${client.id} for ${rateLimitDecision.throttleDelayMs}ms.`
+          )
+        );
+
+        await delay(rateLimitDecision.throttleDelayMs);
+
+        if (client.socket.readyState !== WebSocket.OPEN) {
+          return;
+        }
+      }
+
       let envelope: SecureEnvelope | null = null;
 
       try {
@@ -1291,6 +1694,16 @@ export class SecureServer {
       client.leaveAll();
       this.clientsById.delete(client.id);
       this.clientIdBySocket.delete(client.socket);
+
+      const disconnectedIp = this.clientIpByClientId.get(client.id);
+
+      this.clientIpByClientId.delete(client.id);
+      this.rateLimitBucketsByClientId.delete(client.id);
+
+      if (disconnectedIp && !this.isIpStillConnected(disconnectedIp)) {
+        this.rateLimitBucketsByIp.delete(disconnectedIp);
+      }
+
       this.handshakeStateBySocket.delete(client.socket);
       this.sharedSecretBySocket.delete(client.socket);
       this.encryptionKeyBySocket.delete(client.socket);
