@@ -1,0 +1,902 @@
+'use strict';
+
+var crypto = require('crypto');
+var WebSocket = require('ws');
+
+function _interopDefault (e) { return e && e.__esModule ? e : { default: e }; }
+
+var WebSocket__default = /*#__PURE__*/_interopDefault(WebSocket);
+
+// src/index.ts
+var DEFAULT_CLOSE_CODE = 1e3;
+var DEFAULT_CLOSE_REASON = "";
+var INTERNAL_HANDSHAKE_EVENT = "__handshake";
+var READY_EVENT = "ready";
+var HANDSHAKE_CURVE = "prime256v1";
+var ENCRYPTION_ALGORITHM = "aes-256-gcm";
+var GCM_IV_LENGTH = 12;
+var GCM_AUTH_TAG_LENGTH = 16;
+var ENCRYPTION_KEY_LENGTH = 32;
+var ENCRYPTED_PACKET_VERSION = 1;
+var ENCRYPTED_PACKET_PREFIX_LENGTH = 1 + GCM_IV_LENGTH + GCM_AUTH_TAG_LENGTH;
+function normalizeToError(error, fallbackMessage) {
+  if (error instanceof Error) {
+    return error;
+  }
+  if (typeof error === "string" && error.trim().length > 0) {
+    return new Error(error);
+  }
+  return new Error(fallbackMessage);
+}
+function decodeRawData(rawData) {
+  if (typeof rawData === "string") {
+    return rawData;
+  }
+  if (rawData instanceof ArrayBuffer) {
+    return Buffer.from(rawData).toString("utf8");
+  }
+  if (Array.isArray(rawData)) {
+    return Buffer.concat(rawData).toString("utf8");
+  }
+  return rawData.toString("utf8");
+}
+function rawDataToBuffer(rawData) {
+  if (typeof rawData === "string") {
+    return Buffer.from(rawData, "utf8");
+  }
+  if (rawData instanceof ArrayBuffer) {
+    return Buffer.from(rawData);
+  }
+  if (Array.isArray(rawData)) {
+    return Buffer.concat(rawData);
+  }
+  return Buffer.from(rawData);
+}
+function serializeEnvelope(event, data) {
+  const envelope = { event, data };
+  return JSON.stringify(envelope);
+}
+function parseEnvelope(rawData) {
+  const decoded = decodeRawData(rawData);
+  const parsed = JSON.parse(decoded);
+  if (typeof parsed !== "object" || parsed === null || typeof parsed.event !== "string") {
+    throw new Error("Invalid message format. Expected { event: string, data: unknown }.");
+  }
+  return {
+    event: parsed.event,
+    data: parsed.data
+  };
+}
+function parseEnvelopeFromText(decodedPayload) {
+  const parsed = JSON.parse(decodedPayload);
+  if (typeof parsed !== "object" || parsed === null || typeof parsed.event !== "string") {
+    throw new Error("Invalid message format. Expected { event: string, data: unknown }.");
+  }
+  return {
+    event: parsed.event,
+    data: parsed.data
+  };
+}
+function decodeCloseReason(reason) {
+  return reason.toString("utf8");
+}
+function isReservedEmitEvent(event) {
+  return event === INTERNAL_HANDSHAKE_EVENT || event === READY_EVENT;
+}
+function createEphemeralHandshakeState() {
+  const ecdh = crypto.createECDH(HANDSHAKE_CURVE);
+  ecdh.generateKeys();
+  return {
+    ecdh,
+    localPublicKey: ecdh.getPublicKey("base64")
+  };
+}
+function parseHandshakePayload(data) {
+  if (typeof data !== "object" || data === null) {
+    throw new Error("Invalid handshake payload format.");
+  }
+  const payload = data;
+  if (typeof payload.publicKey !== "string" || payload.publicKey.length === 0) {
+    throw new Error("Handshake payload must include a non-empty public key.");
+  }
+  return {
+    publicKey: payload.publicKey
+  };
+}
+function deriveEncryptionKey(sharedSecret) {
+  const derivedKey = crypto.createHash("sha256").update(sharedSecret).digest();
+  if (derivedKey.length !== ENCRYPTION_KEY_LENGTH) {
+    throw new Error("Failed to derive a valid AES-256 key.");
+  }
+  return derivedKey;
+}
+function encryptSerializedEnvelope(serializedEnvelope, encryptionKey) {
+  const iv = crypto.randomBytes(GCM_IV_LENGTH);
+  const cipher = crypto.createCipheriv(ENCRYPTION_ALGORITHM, encryptionKey, iv);
+  const ciphertext = Buffer.concat([
+    cipher.update(serializedEnvelope, "utf8"),
+    cipher.final()
+  ]);
+  const authTag = cipher.getAuthTag();
+  return Buffer.concat([
+    Buffer.from([ENCRYPTED_PACKET_VERSION]),
+    iv,
+    authTag,
+    ciphertext
+  ]);
+}
+function parseEncryptedPacket(rawData) {
+  const packetBuffer = rawDataToBuffer(rawData);
+  if (packetBuffer.length <= ENCRYPTED_PACKET_PREFIX_LENGTH) {
+    throw new Error("Encrypted packet is too short.");
+  }
+  const version = packetBuffer.readUInt8(0);
+  if (version !== ENCRYPTED_PACKET_VERSION) {
+    throw new Error("Unsupported encrypted packet version.");
+  }
+  const ivStart = 1;
+  const ivEnd = ivStart + GCM_IV_LENGTH;
+  const authTagStart = ivEnd;
+  const authTagEnd = authTagStart + GCM_AUTH_TAG_LENGTH;
+  const iv = packetBuffer.subarray(ivStart, ivEnd);
+  const authTag = packetBuffer.subarray(authTagStart, authTagEnd);
+  const ciphertext = packetBuffer.subarray(authTagEnd);
+  if (ciphertext.length === 0) {
+    throw new Error("Encrypted payload is empty.");
+  }
+  return {
+    iv,
+    authTag,
+    ciphertext
+  };
+}
+function decryptSerializedEnvelope(rawData, encryptionKey) {
+  const encryptedPacket = parseEncryptedPacket(rawData);
+  const decipher = crypto.createDecipheriv(
+    ENCRYPTION_ALGORITHM,
+    encryptionKey,
+    encryptedPacket.iv
+  );
+  decipher.setAuthTag(encryptedPacket.authTag);
+  const plaintext = Buffer.concat([
+    decipher.update(encryptedPacket.ciphertext),
+    decipher.final()
+  ]);
+  return plaintext.toString("utf8");
+}
+var SecureServer = class {
+  socketServer;
+  clientsById = /* @__PURE__ */ new Map();
+  clientIdBySocket = /* @__PURE__ */ new Map();
+  customEventHandlers = /* @__PURE__ */ new Map();
+  connectionHandlers = /* @__PURE__ */ new Set();
+  disconnectHandlers = /* @__PURE__ */ new Set();
+  readyHandlers = /* @__PURE__ */ new Set();
+  errorHandlers = /* @__PURE__ */ new Set();
+  handshakeStateBySocket = /* @__PURE__ */ new WeakMap();
+  sharedSecretBySocket = /* @__PURE__ */ new WeakMap();
+  encryptionKeyBySocket = /* @__PURE__ */ new WeakMap();
+  pendingPayloadsBySocket = /* @__PURE__ */ new WeakMap();
+  constructor(options) {
+    this.socketServer = new WebSocket.WebSocketServer(options);
+    this.bindSocketServerEvents();
+  }
+  get clientCount() {
+    return this.clientsById.size;
+  }
+  get clients() {
+    return this.clientsById;
+  }
+  on(event, handler) {
+    try {
+      if (event === "connection") {
+        this.connectionHandlers.add(handler);
+        return this;
+      }
+      if (event === "disconnect") {
+        this.disconnectHandlers.add(handler);
+        return this;
+      }
+      if (event === READY_EVENT) {
+        this.readyHandlers.add(handler);
+        return this;
+      }
+      if (event === "error") {
+        this.errorHandlers.add(handler);
+        return this;
+      }
+      if (event === INTERNAL_HANDSHAKE_EVENT) {
+        throw new Error(`The event "${INTERNAL_HANDSHAKE_EVENT}" is reserved for internal use.`);
+      }
+      const typedHandler = handler;
+      const listeners = this.customEventHandlers.get(event) ?? /* @__PURE__ */ new Set();
+      listeners.add(typedHandler);
+      this.customEventHandlers.set(event, listeners);
+    } catch (error) {
+      this.notifyError(
+        normalizeToError(error, "Failed to register server event handler.")
+      );
+    }
+    return this;
+  }
+  off(event, handler) {
+    try {
+      if (event === "connection") {
+        this.connectionHandlers.delete(handler);
+        return this;
+      }
+      if (event === "disconnect") {
+        this.disconnectHandlers.delete(handler);
+        return this;
+      }
+      if (event === READY_EVENT) {
+        this.readyHandlers.delete(handler);
+        return this;
+      }
+      if (event === "error") {
+        this.errorHandlers.delete(handler);
+        return this;
+      }
+      if (event === INTERNAL_HANDSHAKE_EVENT) {
+        return this;
+      }
+      const listeners = this.customEventHandlers.get(event);
+      if (!listeners) {
+        return this;
+      }
+      listeners.delete(handler);
+      if (listeners.size === 0) {
+        this.customEventHandlers.delete(event);
+      }
+    } catch (error) {
+      this.notifyError(
+        normalizeToError(error, "Failed to remove server event handler.")
+      );
+    }
+    return this;
+  }
+  emit(event, data) {
+    try {
+      if (isReservedEmitEvent(event)) {
+        throw new Error(`The event "${event}" is reserved and cannot be emitted manually.`);
+      }
+      const envelope = { event, data };
+      for (const client of this.clientsById.values()) {
+        this.sendOrQueuePayload(client.socket, envelope);
+      }
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to emit server event."));
+    }
+    return this;
+  }
+  emitTo(clientId, event, data) {
+    try {
+      if (isReservedEmitEvent(event)) {
+        throw new Error(`The event "${event}" is reserved and cannot be emitted manually.`);
+      }
+      const client = this.clientsById.get(clientId);
+      if (!client) {
+        throw new Error(`Client with id ${clientId} was not found.`);
+      }
+      this.sendOrQueuePayload(client.socket, { event, data });
+      return true;
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to emit event to client."));
+      return false;
+    }
+  }
+  close(code = DEFAULT_CLOSE_CODE, reason = DEFAULT_CLOSE_REASON) {
+    try {
+      for (const client of this.clientsById.values()) {
+        if (client.socket.readyState === WebSocket__default.default.OPEN || client.socket.readyState === WebSocket__default.default.CONNECTING) {
+          client.socket.close(code, reason);
+        }
+      }
+      this.socketServer.close();
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to close server."));
+    }
+  }
+  bindSocketServerEvents() {
+    this.socketServer.on("connection", (socket, request) => {
+      this.handleConnection(socket, request);
+    });
+    this.socketServer.on("error", (error) => {
+      this.notifyError(normalizeToError(error, "WebSocket server encountered an error."));
+    });
+  }
+  handleConnection(socket, request) {
+    try {
+      const clientId = crypto.randomUUID();
+      const handshakeState = this.createServerHandshakeState();
+      const client = {
+        id: clientId,
+        socket,
+        request
+      };
+      this.clientsById.set(clientId, client);
+      this.clientIdBySocket.set(socket, clientId);
+      this.handshakeStateBySocket.set(socket, handshakeState);
+      this.pendingPayloadsBySocket.set(socket, []);
+      socket.on("message", (rawData) => {
+        this.handleIncomingMessage(client, rawData);
+      });
+      socket.on("close", (code, reason) => {
+        this.handleDisconnection(client, code, reason);
+      });
+      socket.on("error", (error) => {
+        this.notifyError(
+          normalizeToError(
+            error,
+            `Client socket error detected for client ${client.id}.`
+          )
+        );
+      });
+      this.sendInternalHandshake(socket, handshakeState.localPublicKey);
+      this.notifyConnection(client);
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to handle client connection."));
+    }
+  }
+  handleIncomingMessage(client, rawData) {
+    try {
+      let envelope = null;
+      try {
+        envelope = parseEnvelope(rawData);
+      } catch {
+        envelope = null;
+      }
+      if (envelope?.event === INTERNAL_HANDSHAKE_EVENT) {
+        this.handleInternalHandshake(client, envelope.data);
+        return;
+      }
+      if (envelope !== null) {
+        this.notifyError(
+          new Error(
+            `Plaintext event "${envelope.event}" was rejected for client ${client.id}.`
+          )
+        );
+        return;
+      }
+      if (!this.isClientHandshakeReady(client.socket)) {
+        this.notifyError(
+          new Error(`Encrypted payload was received before handshake completion for client ${client.id}.`)
+        );
+        return;
+      }
+      const encryptionKey = this.encryptionKeyBySocket.get(client.socket);
+      if (!encryptionKey) {
+        this.notifyError(new Error(`Missing encryption key for client ${client.id}.`));
+        return;
+      }
+      let decryptedPayload;
+      try {
+        decryptedPayload = decryptSerializedEnvelope(rawData, encryptionKey);
+      } catch {
+        console.warn("Tampered data detected and dropped");
+        return;
+      }
+      const decryptedEnvelope = parseEnvelopeFromText(decryptedPayload);
+      this.dispatchCustomEvent(decryptedEnvelope.event, decryptedEnvelope.data, client);
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to process incoming server message."));
+    }
+  }
+  handleDisconnection(client, code, reason) {
+    try {
+      this.clientsById.delete(client.id);
+      this.clientIdBySocket.delete(client.socket);
+      this.handshakeStateBySocket.delete(client.socket);
+      this.sharedSecretBySocket.delete(client.socket);
+      this.encryptionKeyBySocket.delete(client.socket);
+      this.pendingPayloadsBySocket.delete(client.socket);
+      const decodedReason = decodeCloseReason(reason);
+      for (const handler of this.disconnectHandlers) {
+        try {
+          handler(client, code, decodedReason);
+        } catch (handlerError) {
+          this.notifyError(
+            normalizeToError(
+              handlerError,
+              `Disconnect handler failed for client ${client.id}.`
+            )
+          );
+        }
+      }
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to process client disconnection."));
+    }
+  }
+  dispatchCustomEvent(event, data, client) {
+    const handlers = this.customEventHandlers.get(event);
+    if (!handlers || handlers.size === 0) {
+      return;
+    }
+    for (const handler of handlers) {
+      try {
+        handler(data, client);
+      } catch (error) {
+        this.notifyError(
+          normalizeToError(
+            error,
+            `Server event handler failed for event ${event}.`
+          )
+        );
+      }
+    }
+  }
+  sendRaw(socket, payload) {
+    try {
+      if (socket.readyState !== WebSocket__default.default.OPEN) {
+        return;
+      }
+      socket.send(payload);
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to send server payload."));
+    }
+  }
+  sendEncryptedEnvelope(socket, envelope) {
+    try {
+      if (socket.readyState !== WebSocket__default.default.OPEN) {
+        return;
+      }
+      const encryptionKey = this.encryptionKeyBySocket.get(socket);
+      if (!encryptionKey) {
+        throw new Error("Missing encryption key for connected socket.");
+      }
+      const encryptedPayload = encryptSerializedEnvelope(
+        serializeEnvelope(envelope.event, envelope.data),
+        encryptionKey
+      );
+      socket.send(encryptedPayload);
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to send encrypted server payload."));
+    }
+  }
+  notifyConnection(client) {
+    for (const handler of this.connectionHandlers) {
+      try {
+        handler(client);
+      } catch (error) {
+        this.notifyError(
+          normalizeToError(error, `Connection handler failed for client ${client.id}.`)
+        );
+      }
+    }
+  }
+  notifyReady(client) {
+    for (const handler of this.readyHandlers) {
+      try {
+        handler(client);
+      } catch (error) {
+        this.notifyError(
+          normalizeToError(error, `Ready handler failed for client ${client.id}.`)
+        );
+      }
+    }
+  }
+  notifyError(error) {
+    if (this.errorHandlers.size === 0) {
+      return;
+    }
+    for (const handler of this.errorHandlers) {
+      try {
+        handler(error);
+      } catch {
+      }
+    }
+  }
+  createServerHandshakeState() {
+    const { ecdh, localPublicKey } = createEphemeralHandshakeState();
+    return {
+      ecdh,
+      localPublicKey,
+      isReady: false
+    };
+  }
+  sendInternalHandshake(socket, localPublicKey) {
+    this.sendRaw(
+      socket,
+      serializeEnvelope(INTERNAL_HANDSHAKE_EVENT, {
+        publicKey: localPublicKey
+      })
+    );
+  }
+  handleInternalHandshake(client, data) {
+    try {
+      const payload = parseHandshakePayload(data);
+      const handshakeState = this.handshakeStateBySocket.get(client.socket);
+      if (!handshakeState) {
+        throw new Error(`Missing handshake state for client ${client.id}.`);
+      }
+      if (handshakeState.isReady) {
+        return;
+      }
+      const remotePublicKey = Buffer.from(payload.publicKey, "base64");
+      const sharedSecret = handshakeState.ecdh.computeSecret(remotePublicKey);
+      const encryptionKey = deriveEncryptionKey(sharedSecret);
+      this.sharedSecretBySocket.set(client.socket, sharedSecret);
+      this.encryptionKeyBySocket.set(client.socket, encryptionKey);
+      handshakeState.isReady = true;
+      this.flushQueuedPayloads(client.socket);
+      this.notifyReady(client);
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to complete server handshake."));
+    }
+  }
+  isClientHandshakeReady(socket) {
+    return this.handshakeStateBySocket.get(socket)?.isReady ?? false;
+  }
+  sendOrQueuePayload(socket, envelope) {
+    if (!this.isClientHandshakeReady(socket)) {
+      this.queuePayload(socket, envelope);
+      return;
+    }
+    this.sendEncryptedEnvelope(socket, envelope);
+  }
+  queuePayload(socket, envelope) {
+    const pendingPayloads = this.pendingPayloadsBySocket.get(socket) ?? [];
+    pendingPayloads.push(envelope);
+    this.pendingPayloadsBySocket.set(socket, pendingPayloads);
+  }
+  flushQueuedPayloads(socket) {
+    const pendingPayloads = this.pendingPayloadsBySocket.get(socket);
+    if (!pendingPayloads || pendingPayloads.length === 0) {
+      return;
+    }
+    this.pendingPayloadsBySocket.delete(socket);
+    for (const envelope of pendingPayloads) {
+      this.sendEncryptedEnvelope(socket, envelope);
+    }
+  }
+};
+var SecureClient = class {
+  constructor(url, options = {}) {
+    this.url = url;
+    this.options = options;
+    if (this.options.autoConnect ?? true) {
+      this.connect();
+    }
+  }
+  url;
+  options;
+  socket = null;
+  customEventHandlers = /* @__PURE__ */ new Map();
+  connectHandlers = /* @__PURE__ */ new Set();
+  disconnectHandlers = /* @__PURE__ */ new Set();
+  readyHandlers = /* @__PURE__ */ new Set();
+  errorHandlers = /* @__PURE__ */ new Set();
+  handshakeState = null;
+  pendingPayloadQueue = [];
+  get readyState() {
+    return this.socket?.readyState ?? null;
+  }
+  isConnected() {
+    return this.socket?.readyState === WebSocket__default.default.OPEN;
+  }
+  connect() {
+    try {
+      if (this.socket && (this.socket.readyState === WebSocket__default.default.OPEN || this.socket.readyState === WebSocket__default.default.CONNECTING)) {
+        return;
+      }
+      const socket = this.createSocket();
+      this.socket = socket;
+      this.handshakeState = this.createClientHandshakeState();
+      this.pendingPayloadQueue = [];
+      this.bindSocketEvents(socket);
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to connect client."));
+    }
+  }
+  disconnect(code = DEFAULT_CLOSE_CODE, reason = DEFAULT_CLOSE_REASON) {
+    try {
+      if (!this.socket) {
+        return;
+      }
+      if (this.socket.readyState === WebSocket__default.default.CLOSING || this.socket.readyState === WebSocket__default.default.CLOSED) {
+        return;
+      }
+      this.socket.close(code, reason);
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to disconnect client."));
+    }
+  }
+  on(event, handler) {
+    try {
+      if (event === "connect") {
+        this.connectHandlers.add(handler);
+        return this;
+      }
+      if (event === "disconnect") {
+        this.disconnectHandlers.add(handler);
+        return this;
+      }
+      if (event === READY_EVENT) {
+        this.readyHandlers.add(handler);
+        return this;
+      }
+      if (event === "error") {
+        this.errorHandlers.add(handler);
+        return this;
+      }
+      if (event === INTERNAL_HANDSHAKE_EVENT) {
+        throw new Error(`The event "${INTERNAL_HANDSHAKE_EVENT}" is reserved for internal use.`);
+      }
+      const typedHandler = handler;
+      const listeners = this.customEventHandlers.get(event) ?? /* @__PURE__ */ new Set();
+      listeners.add(typedHandler);
+      this.customEventHandlers.set(event, listeners);
+    } catch (error) {
+      this.notifyError(
+        normalizeToError(error, "Failed to register client event handler.")
+      );
+    }
+    return this;
+  }
+  off(event, handler) {
+    try {
+      if (event === "connect") {
+        this.connectHandlers.delete(handler);
+        return this;
+      }
+      if (event === "disconnect") {
+        this.disconnectHandlers.delete(handler);
+        return this;
+      }
+      if (event === READY_EVENT) {
+        this.readyHandlers.delete(handler);
+        return this;
+      }
+      if (event === "error") {
+        this.errorHandlers.delete(handler);
+        return this;
+      }
+      if (event === INTERNAL_HANDSHAKE_EVENT) {
+        return this;
+      }
+      const listeners = this.customEventHandlers.get(event);
+      if (!listeners) {
+        return this;
+      }
+      listeners.delete(handler);
+      if (listeners.size === 0) {
+        this.customEventHandlers.delete(event);
+      }
+    } catch (error) {
+      this.notifyError(
+        normalizeToError(error, "Failed to remove client event handler.")
+      );
+    }
+    return this;
+  }
+  emit(event, data) {
+    try {
+      if (isReservedEmitEvent(event)) {
+        throw new Error(`The event "${event}" is reserved and cannot be emitted manually.`);
+      }
+      if (!this.socket || this.socket.readyState !== WebSocket__default.default.OPEN) {
+        throw new Error("Client socket is not connected.");
+      }
+      const envelope = { event, data };
+      if (!this.isHandshakeReady()) {
+        this.pendingPayloadQueue.push(envelope);
+        return true;
+      }
+      this.sendEncryptedEnvelope(envelope);
+      return true;
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to emit client event."));
+      return false;
+    }
+  }
+  createSocket() {
+    if (this.options.protocols !== void 0) {
+      return new WebSocket__default.default(this.url, this.options.protocols, this.options.wsOptions);
+    }
+    if (this.options.wsOptions !== void 0) {
+      return new WebSocket__default.default(this.url, this.options.wsOptions);
+    }
+    return new WebSocket__default.default(this.url);
+  }
+  bindSocketEvents(socket) {
+    socket.on("open", () => {
+      this.sendInternalHandshake();
+      this.notifyConnect();
+    });
+    socket.on("message", (rawData) => {
+      this.handleIncomingMessage(rawData);
+    });
+    socket.on("close", (code, reason) => {
+      this.handleDisconnect(code, reason);
+    });
+    socket.on("error", (error) => {
+      this.notifyError(normalizeToError(error, "Client socket encountered an error."));
+    });
+  }
+  handleIncomingMessage(rawData) {
+    try {
+      let envelope = null;
+      try {
+        envelope = parseEnvelope(rawData);
+      } catch {
+        envelope = null;
+      }
+      if (envelope?.event === INTERNAL_HANDSHAKE_EVENT) {
+        this.handleInternalHandshake(envelope.data);
+        return;
+      }
+      if (envelope !== null) {
+        this.notifyError(
+          new Error(`Plaintext event "${envelope.event}" was rejected on client.`)
+        );
+        return;
+      }
+      if (!this.isHandshakeReady()) {
+        this.notifyError(new Error("Encrypted payload was received before handshake completion."));
+        return;
+      }
+      const encryptionKey = this.handshakeState?.encryptionKey;
+      if (!encryptionKey) {
+        this.notifyError(new Error("Missing encryption key for client payload decryption."));
+        return;
+      }
+      let decryptedPayload;
+      try {
+        decryptedPayload = decryptSerializedEnvelope(rawData, encryptionKey);
+      } catch {
+        console.warn("Tampered data detected and dropped");
+        return;
+      }
+      const decryptedEnvelope = parseEnvelopeFromText(decryptedPayload);
+      this.dispatchCustomEvent(decryptedEnvelope.event, decryptedEnvelope.data);
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to process incoming client message."));
+    }
+  }
+  handleDisconnect(code, reason) {
+    try {
+      this.socket = null;
+      this.handshakeState = null;
+      this.pendingPayloadQueue = [];
+      const decodedReason = decodeCloseReason(reason);
+      for (const handler of this.disconnectHandlers) {
+        try {
+          handler(code, decodedReason);
+        } catch (handlerError) {
+          this.notifyError(
+            normalizeToError(handlerError, "Client disconnect handler failed.")
+          );
+        }
+      }
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to handle client disconnect."));
+    }
+  }
+  dispatchCustomEvent(event, data) {
+    const handlers = this.customEventHandlers.get(event);
+    if (!handlers || handlers.size === 0) {
+      return;
+    }
+    for (const handler of handlers) {
+      try {
+        handler(data);
+      } catch (error) {
+        this.notifyError(
+          normalizeToError(error, `Client event handler failed for event ${event}.`)
+        );
+      }
+    }
+  }
+  notifyConnect() {
+    for (const handler of this.connectHandlers) {
+      try {
+        handler();
+      } catch (error) {
+        this.notifyError(normalizeToError(error, "Client connect handler failed."));
+      }
+    }
+  }
+  notifyReady() {
+    for (const handler of this.readyHandlers) {
+      try {
+        handler();
+      } catch (error) {
+        this.notifyError(normalizeToError(error, "Client ready handler failed."));
+      }
+    }
+  }
+  notifyError(error) {
+    if (this.errorHandlers.size === 0) {
+      return;
+    }
+    for (const handler of this.errorHandlers) {
+      try {
+        handler(error);
+      } catch {
+      }
+    }
+  }
+  sendEncryptedEnvelope(envelope) {
+    try {
+      if (!this.socket || this.socket.readyState !== WebSocket__default.default.OPEN) {
+        throw new Error("Client socket is not connected.");
+      }
+      const encryptionKey = this.handshakeState?.encryptionKey;
+      if (!encryptionKey) {
+        throw new Error("Missing encryption key for client payload encryption.");
+      }
+      const encryptedPayload = encryptSerializedEnvelope(
+        serializeEnvelope(envelope.event, envelope.data),
+        encryptionKey
+      );
+      this.socket.send(encryptedPayload);
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to send encrypted client payload."));
+    }
+  }
+  createClientHandshakeState() {
+    const { ecdh, localPublicKey } = createEphemeralHandshakeState();
+    return {
+      ecdh,
+      localPublicKey,
+      isReady: false,
+      sharedSecret: null,
+      encryptionKey: null
+    };
+  }
+  sendInternalHandshake() {
+    try {
+      if (!this.socket || this.socket.readyState !== WebSocket__default.default.OPEN) {
+        return;
+      }
+      if (!this.handshakeState) {
+        throw new Error("Missing client handshake state.");
+      }
+      this.socket.send(
+        serializeEnvelope(INTERNAL_HANDSHAKE_EVENT, {
+          publicKey: this.handshakeState.localPublicKey
+        })
+      );
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to send client handshake payload."));
+    }
+  }
+  handleInternalHandshake(data) {
+    try {
+      const payload = parseHandshakePayload(data);
+      if (!this.handshakeState) {
+        throw new Error("Missing client handshake state.");
+      }
+      if (this.handshakeState.isReady) {
+        return;
+      }
+      const remotePublicKey = Buffer.from(payload.publicKey, "base64");
+      const sharedSecret = this.handshakeState.ecdh.computeSecret(remotePublicKey);
+      this.handshakeState.sharedSecret = sharedSecret;
+      this.handshakeState.encryptionKey = deriveEncryptionKey(sharedSecret);
+      this.handshakeState.isReady = true;
+      this.flushPendingPayloadQueue();
+      this.notifyReady();
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to complete client handshake."));
+    }
+  }
+  isHandshakeReady() {
+    return this.handshakeState?.isReady ?? false;
+  }
+  flushPendingPayloadQueue() {
+    if (!this.socket || this.socket.readyState !== WebSocket__default.default.OPEN || !this.isHandshakeReady()) {
+      return;
+    }
+    const pendingPayloads = this.pendingPayloadQueue;
+    this.pendingPayloadQueue = [];
+    for (const envelope of pendingPayloads) {
+      this.sendEncryptedEnvelope(envelope);
+    }
+  }
+};
+
+exports.SecureClient = SecureClient;
+exports.SecureServer = SecureServer;
+//# sourceMappingURL=index.cjs.map
+//# sourceMappingURL=index.cjs.map

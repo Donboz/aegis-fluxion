@@ -1,0 +1,19 @@
+{
+  "name": "aegis-fluxion",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Monorepo for the aegis-fluxion E2E encrypted WebSocket toolkit.",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @aegis-fluxion/core",
+    "dev": "npm run dev -w @aegis-fluxion/core",
+    "typecheck": "npm run typecheck -w @aegis-fluxion/core",
+    "test": "npm run test -w @aegis-fluxion/core",
+    "clean": "npm run clean -w @aegis-fluxion/core"
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  }
+}
