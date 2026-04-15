@@ -2,21 +2,21 @@
 
 Low-level E2E-encrypted WebSocket primitives for the `aegis-fluxion` ecosystem.
 
-If you want a single user-facing package, use [`aegis-fluxion`](../aegis-fluxion/README.md).
+If you prefer a single user-facing package, use [`aegis-fluxion`](../aegis-fluxion/README.md).
 
-Version: **0.4.0**
+Version: **0.5.0**
 
 ---
 
-## Features
+## Highlights
 
 - Ephemeral ECDH handshake (`prime256v1`)
-- AES-256-GCM encrypted application envelopes
-- Server/client lifecycle hooks (`connect`, `ready`, `disconnect`, `error`)
+- AES-256-GCM encrypted envelopes
+- Encrypted ACK request/response (`Promise` and callback)
 - Secure room routing (`join`, `leave`, `leaveAll`, `to(room).emit`)
-- Heartbeat Ping/Pong zombie cleanup
-- Client auto-reconnect with exponential backoff
-- Encrypted RPC-style ACK request/response (Promise and callback)
+- Heartbeat and zombie socket cleanup
+- Auto-reconnect with fresh re-handshake
+- **Binary payload support**: `Buffer`, `Uint8Array`, `Blob`
 
 ---
 
@@ -24,6 +24,87 @@ Version: **0.4.0**
 
 ```bash
 npm install @aegis-fluxion/core ws
+```
+
+---
+
+## Binary Data Support
+
+`@aegis-fluxion/core` supports encrypted binary payload transfer while preserving type fidelity.
+
+Supported send/receive types:
+
+- `Buffer`
+- `Uint8Array`
+- `Blob`
+
+Binary values can be nested in regular objects and arrays.
+
+---
+
+## Example: Encrypted Binary Event
+
+```ts
+import { SecureClient, SecureServer } from "@aegis-fluxion/core";
+
+const server = new SecureServer({ host: "127.0.0.1", port: 8080 });
+const client = new SecureClient("ws://127.0.0.1:8080");
+
+server.on("image:chunk", (data, socket) => {
+  const chunk = data as Buffer;
+
+  if (!Buffer.isBuffer(chunk)) {
+    throw new Error("Expected Buffer payload.");
+  }
+
+  socket.emit("image:chunk:ack", chunk);
+});
+
+client.on("ready", () => {
+  const imageChunk = Buffer.from("89504e470d0a", "hex");
+  client.emit("image:chunk", imageChunk);
+});
+
+client.on("image:chunk:ack", (payload) => {
+  const echoedChunk = payload as Buffer;
+  console.log("Echoed bytes:", echoedChunk.byteLength);
+});
+```
+
+---
+
+## Example: ACK Roundtrip with Mixed Binary Types
+
+```ts
+server.on("binary:inspect", async (payload) => {
+  const { file, bytes, blob } = payload as {
+    file: Buffer;
+    bytes: Uint8Array;
+    blob: Blob;
+  };
+
+  return {
+    fileBytes: file.byteLength,
+    bytesBytes: bytes.byteLength,
+    blobBytes: blob.size
+  };
+});
+
+client.on("ready", async () => {
+  const result = await client.emit(
+    "binary:inspect",
+    {
+      file: Buffer.from("file-binary"),
+      bytes: Uint8Array.from([1, 2, 3, 4]),
+      blob: new Blob([Buffer.from("blob-binary")], {
+        type: "application/octet-stream"
+      })
+    },
+    { timeoutMs: 1500 }
+  );
+
+  console.log(result);
+});
 ```
 
 ---
@@ -66,72 +147,12 @@ npm install @aegis-fluxion/core ws
 
 ---
 
-## ACK Request/Response Examples
-
-### Client -> Server (Promise)
-
-```ts
-import { SecureClient, SecureServer } from "@aegis-fluxion/core";
-
-const server = new SecureServer({ host: "127.0.0.1", port: 8080 });
-
-server.on("math:add", ({ a, b }) => {
-  return { total: Number(a) + Number(b) };
-});
-
-const client = new SecureClient("ws://127.0.0.1:8080");
-
-client.on("ready", async () => {
-  const response = await client.emit(
-    "math:add",
-    { a: 2, b: 3 },
-    { timeoutMs: 1000 }
-  );
-
-  console.log(response); // { total: 5 }
-});
-```
-
-### Client -> Server (Callback)
-
-```ts
-client.emit(
-  "math:add",
-  { a: 4, b: 6 },
-  { timeoutMs: 1000 },
-  (error, response) => {
-    if (error) {
-      console.error(error.message);
-      return;
-    }
-
-    console.log(response); // { total: 10 }
-  }
-);
-```
-
-### Server -> Client (Promise)
-
-```ts
-server.on("ready", async (clientSocket) => {
-  const response = await clientSocket.emit(
-    "agent:health",
-    { verbose: true },
-    { timeoutMs: 1200 }
-  );
-
-  console.log(response);
-});
-```
-
----
-
 ## Security Notes
 
-- ACK requests and responses use the same encrypted AES-GCM channel.
-- Internal handshake/RPC transport events are reserved.
+- All payloads (including binary) are encrypted end-to-end with AES-256-GCM.
+- Authentication tags are verified on every packet (tampered packets are dropped).
+- Internal transport events are reserved (`__handshake`, `__rpc:req`, `__rpc:res`).
 - Pending ACK requests are rejected on timeout/disconnect.
-- Tampered encrypted packets are dropped.
 
 ---
 
@@ -143,16 +164,6 @@ From repository root:
 npm run typecheck -w @aegis-fluxion/core
 npm run test -w @aegis-fluxion/core
 npm run build -w @aegis-fluxion/core
-```
-
----
-
-## Publish
-
-From repository root:
-
-```bash
-npm publish -w @aegis-fluxion/core --access public
 ```
 
 ---

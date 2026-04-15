@@ -1,104 +1,116 @@
 # aegis-fluxion
 
-![Version](https://img.shields.io/badge/version-0.4.0-2563eb)
+![Version](https://img.shields.io/badge/version-0.5.0-2563eb)
 ![Node](https://img.shields.io/badge/node-%3E%3D18.18.0-16a34a)
 ![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178c6)
 ![Crypto](https://img.shields.io/badge/Crypto-ECDH%20%2B%20AES--256--GCM-0f172a)
 
 `aegis-fluxion` is an end-to-end encrypted WebSocket toolkit for Node.js and TypeScript.
 
-This repository is a monorepo containing:
-
-| Package | Purpose |
-| --- | --- |
-| `aegis-fluxion` | Main end-user umbrella package (recommended) |
-| `@aegis-fluxion/core` | Low-level core primitives |
+It provides a secure event channel with ephemeral ECDH key exchange, AES-256-GCM encryption,
+encrypted ACK request/response, and **native binary payload support** for `Buffer`, `Uint8Array`,
+and `Blob`.
 
 ---
 
-## Key Capabilities
+## Packages
 
-- Ephemeral ECDH handshake (`prime256v1`) for per-session key exchange
-- AES-256-GCM encrypted message envelopes
-- Secure room routing (`join`, `leave`, `to(room).emit`)
-- Heartbeat Ping/Pong zombie cleanup
-- Auto-reconnect with exponential backoff and fresh re-handshake
-- Encrypted RPC-style ACK request/response with timeout protection
+| Package | Purpose |
+| --- | --- |
+| `aegis-fluxion` | Main end-user package (recommended) |
+| `@aegis-fluxion/core` | Low-level primitives and transport internals |
+
+---
+
+## What's New in 0.5.0
+
+- Binary data support over encrypted channels (`Buffer`, `Uint8Array`, `Blob`)
+- Type-preserving binary roundtrip in both direct events and ACK flows
+- Nested payload support (JSON + binary in the same message)
 
 ---
 
 ## Install
 
-### Recommended (umbrella package)
-
 ```bash
 npm install aegis-fluxion ws
 ```
 
-### Low-level core only
-
-```bash
-npm install @aegis-fluxion/core ws
-```
-
 ---
 
-## Quick Start (ACK over encrypted tunnel)
+## Quick Start (Encrypted Binary + ACK)
 
 ```ts
 import { SecureServer, SecureClient } from "aegis-fluxion";
 
 const server = new SecureServer({ host: "127.0.0.1", port: 8080 });
 
-server.on("user:lookup", ({ userId }) => {
-  return { userId, role: "operator", status: "active" };
+server.on("binary:inspect", async (payload) => {
+  const { file, bytes, blob } = payload as {
+    file: Buffer;
+    bytes: Uint8Array;
+    blob: Blob;
+  };
+
+  return {
+    fileSize: file.byteLength,
+    bytesSize: bytes.byteLength,
+    blobSize: blob.size,
+    blobType: blob.type
+  };
 });
 
 const client = new SecureClient("ws://127.0.0.1:8080");
 
 client.on("ready", async () => {
-  const response = await client.emit(
-    "user:lookup",
-    { userId: "u-42" },
+  const result = await client.emit(
+    "binary:inspect",
+    {
+      file: Buffer.from("hello-binary"),
+      bytes: Uint8Array.from([10, 20, 30, 40]),
+      blob: new Blob([Buffer.from("blob-bytes")], {
+        type: "application/octet-stream"
+      })
+    },
     { timeoutMs: 2000 }
   );
 
-  console.log(response);
+  console.log(result);
 });
-```
-
-Callback-style ACK is also supported:
-
-```ts
-client.emit(
-  "user:lookup",
-  { userId: "u-99" },
-  { timeoutMs: 2000 },
-  (error, response) => {
-    if (error) {
-      console.error(error.message);
-      return;
-    }
-
-    console.log(response);
-  }
-);
 ```
 
 ---
 
-## Security & Reliability Notes
+## Binary Payload Behavior
 
-- ACK request/response payloads are encrypted like all other application events.
-- Internal transport events are reserved and protected from manual emission.
-- Tampered AES-GCM frames are dropped.
-- Pending ACK requests are cleaned on timeout/disconnect.
+- `Buffer` arrives as `Buffer`
+- `Uint8Array` arrives as `Uint8Array`
+- `Blob` arrives as `Blob` (falls back to `Buffer` if `Blob` is unavailable in runtime)
+- Binary values can be nested inside regular JSON objects/arrays
+
+---
+
+## Security Model
+
+- Ephemeral ECDH (`prime256v1`) derives per-session secrets
+- AES-256-GCM encrypts all application payloads (JSON and binary)
+- GCM authentication tag enforces tamper detection and integrity
+- Internal transport events are reserved and blocked from manual emit
+
+---
+
+## Reliability Features
+
+- Heartbeat Ping/Pong stale-connection cleanup
+- Client auto-reconnect with exponential backoff and jitter
+- Fresh re-handshake and key derivation after reconnect
+- Promise and callback ACK APIs with per-request timeouts
 
 ---
 
 ## Changelog
 
-See [`CHANGELOG.md`](./CHANGELOG.md) for release history from `0.1.0` to `0.4.0`.
+See [`CHANGELOG.md`](./CHANGELOG.md) for complete release history.
 
 ---
 
@@ -111,17 +123,6 @@ npm install
 npm run typecheck
 npm run test
 npm run build
-```
-
----
-
-## Publish
-
-From repository root:
-
-```bash
-npm run publish:core
-npm run publish:umbrella
 ```
 
 ---

@@ -28,6 +28,8 @@ const GCM_AUTH_TAG_LENGTH = 16;
 const ENCRYPTION_KEY_LENGTH = 32;
 const ENCRYPTED_PACKET_VERSION = 1;
 const ENCRYPTED_PACKET_PREFIX_LENGTH = 1 + GCM_IV_LENGTH + GCM_AUTH_TAG_LENGTH;
+const BINARY_PAYLOAD_MARKER = "__afxBinaryPayload";
+const BINARY_PAYLOAD_VERSION = 1;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 15_000;
 const DEFAULT_RECONNECT_INITIAL_DELAY_MS = 250;
@@ -79,10 +81,21 @@ interface PendingRpcRequest {
   timeoutHandle: ReturnType<typeof setTimeout>;
 }
 
+type BinaryPayloadKind = "buffer" | "uint8array" | "blob";
+
+interface EncodedBinaryPayload {
+  [BINARY_PAYLOAD_MARKER]: number;
+  kind: BinaryPayloadKind;
+  base64: string;
+  mimeType?: string;
+}
+
 export interface SecureEnvelope<TData = unknown> {
   event: string;
   data: TData;
 }
+
+export type SecureBinaryPayload = Buffer | Uint8Array | Blob;
 
 export interface SecureAckOptions {
   timeoutMs?: number;
@@ -238,7 +251,140 @@ function rawDataToBuffer(rawData: RawData): Buffer {
   return Buffer.from(rawData);
 }
 
-function serializeEnvelope(event: string, data: unknown): string {
+function isBlobValue(value: unknown): value is Blob {
+  return typeof Blob !== "undefined" && value instanceof Blob;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function encodeBinaryPayload(
+  kind: BinaryPayloadKind,
+  payloadBuffer: Buffer,
+  mimeType?: string
+): EncodedBinaryPayload {
+  const encodedPayload: EncodedBinaryPayload = {
+    [BINARY_PAYLOAD_MARKER]: BINARY_PAYLOAD_VERSION,
+    kind,
+    base64: payloadBuffer.toString("base64")
+  };
+
+  if (mimeType !== undefined && mimeType.length > 0) {
+    encodedPayload.mimeType = mimeType;
+  }
+
+  return encodedPayload;
+}
+
+async function encodeEnvelopeData(value: unknown): Promise<unknown> {
+  if (Buffer.isBuffer(value)) {
+    return encodeBinaryPayload("buffer", value);
+  }
+
+  if (value instanceof Uint8Array) {
+    const typedArrayBuffer = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    return encodeBinaryPayload("uint8array", typedArrayBuffer);
+  }
+
+  if (isBlobValue(value)) {
+    const blobBuffer = Buffer.from(await value.arrayBuffer());
+    return encodeBinaryPayload("blob", blobBuffer, value.type);
+  }
+
+  if (Array.isArray(value)) {
+    return Promise.all(value.map((item) => encodeEnvelopeData(item)));
+  }
+
+  if (isPlainObject(value)) {
+    const encodedEntries = await Promise.all(
+      Object.entries(value).map(async ([key, entryValue]) => {
+        return [key, await encodeEnvelopeData(entryValue)] as const;
+      })
+    );
+
+    return Object.fromEntries(encodedEntries);
+  }
+
+  return value;
+}
+
+function isEncodedBinaryPayload(value: unknown): value is EncodedBinaryPayload {
+  if (!isPlainObject(value)) {
+    return false;
+  }
+
+  if (value[BINARY_PAYLOAD_MARKER] !== BINARY_PAYLOAD_VERSION) {
+    return false;
+  }
+
+  if (
+    value.kind !== "buffer" &&
+    value.kind !== "uint8array" &&
+    value.kind !== "blob"
+  ) {
+    return false;
+  }
+
+  if (typeof value.base64 !== "string") {
+    return false;
+  }
+
+  if (value.mimeType !== undefined && typeof value.mimeType !== "string") {
+    return false;
+  }
+
+  return true;
+}
+
+function decodeEnvelopeData(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => decodeEnvelopeData(item));
+  }
+
+  if (isEncodedBinaryPayload(value)) {
+    const binaryBuffer = Buffer.from(value.base64, "base64");
+
+    if (value.kind === "buffer") {
+      return binaryBuffer;
+    }
+
+    if (value.kind === "uint8array") {
+      return Uint8Array.from(binaryBuffer);
+    }
+
+    if (typeof Blob === "undefined") {
+      return binaryBuffer;
+    }
+
+    return new Blob([binaryBuffer], {
+      type: value.mimeType ?? ""
+    });
+  }
+
+  if (isPlainObject(value)) {
+    const decodedEntries = Object.entries(value).map(([key, entryValue]) => {
+      return [key, decodeEnvelopeData(entryValue)] as const;
+    });
+
+    return Object.fromEntries(decodedEntries);
+  }
+
+  return value;
+}
+
+async function serializeEnvelope(event: string, data: unknown): Promise<string> {
+  const encodedData = await encodeEnvelopeData(data);
+  const envelope: SecureEnvelope = { event, data: encodedData };
+  return JSON.stringify(envelope);
+}
+
+function serializePlainEnvelope(event: string, data: unknown): string {
   const envelope: SecureEnvelope = { event, data };
   return JSON.stringify(envelope);
 }
@@ -257,7 +403,7 @@ function parseEnvelope(rawData: RawData): SecureEnvelope {
 
   return {
     event: parsed.event,
-    data: parsed.data
+    data: decodeEnvelopeData(parsed.data)
   };
 }
 
@@ -274,7 +420,7 @@ function parseEnvelopeFromText(decodedPayload: string): SecureEnvelope {
 
   return {
     event: parsed.event,
-    data: parsed.data
+    data: decodeEnvelopeData(parsed.data)
   };
 }
 
@@ -671,7 +817,9 @@ export class SecureServer {
       const envelope: SecureEnvelope = { event, data };
 
       for (const client of this.clientsById.values()) {
-        this.sendOrQueuePayload(client.socket, envelope);
+        void this.sendOrQueuePayload(client.socket, envelope).catch(() => {
+          return undefined;
+        });
       }
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to emit server event."));
@@ -721,7 +869,9 @@ export class SecureServer {
       }
 
       if (!ackArgs.expectsAck) {
-        this.sendOrQueuePayload(client.socket, { event, data });
+        void this.sendOrQueuePayload(client.socket, { event, data }).catch(() => {
+          return undefined;
+        });
         return true;
       }
 
@@ -1117,26 +1267,27 @@ export class SecureServer {
     }
   }
 
-  private sendEncryptedEnvelope(socket: WebSocket, envelope: SecureEnvelope): void {
+  private async sendEncryptedEnvelope(socket: WebSocket, envelope: SecureEnvelope): Promise<void> {
+    if (socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    const encryptionKey = this.encryptionKeyBySocket.get(socket);
+
+    if (!encryptionKey) {
+      const missingKeyError = new Error("Missing encryption key for connected socket.");
+      this.notifyError(missingKeyError);
+      throw missingKeyError;
+    }
+
     try {
-      if (socket.readyState !== WebSocket.OPEN) {
-        return;
-      }
-
-      const encryptionKey = this.encryptionKeyBySocket.get(socket);
-
-      if (!encryptionKey) {
-        throw new Error("Missing encryption key for connected socket.");
-      }
-
-      const encryptedPayload = encryptSerializedEnvelope(
-        serializeEnvelope(envelope.event, envelope.data),
-        encryptionKey
-      );
-
+      const serializedEnvelope = await serializeEnvelope(envelope.event, envelope.data);
+      const encryptedPayload = encryptSerializedEnvelope(serializedEnvelope, encryptionKey);
       socket.send(encryptedPayload);
     } catch (error) {
-      this.notifyError(normalizeToError(error, "Failed to send encrypted server payload."));
+      const normalizedError = normalizeToError(error, "Failed to send encrypted server payload.");
+      this.notifyError(normalizedError);
+      throw normalizedError;
     }
   }
 
@@ -1170,13 +1321,19 @@ export class SecureServer {
         timeoutHandle
       });
 
-      this.sendOrQueuePayload(socket, {
+      void this.sendOrQueuePayload(socket, {
         event: INTERNAL_RPC_REQUEST_EVENT,
         data: {
           id: requestId,
           event,
           data
         } satisfies RpcRequestPayload
+      }).catch((error) => {
+        clearTimeout(timeoutHandle);
+        pendingRequests.delete(requestId);
+        reject(
+          normalizeToError(error, `Failed to dispatch ACK request for event "${event}".`)
+        );
       });
     });
   }
@@ -1229,7 +1386,7 @@ export class SecureServer {
         client
       );
 
-      this.sendEncryptedEnvelope(client.socket, {
+      await this.sendEncryptedEnvelope(client.socket, {
         event: INTERNAL_RPC_RESPONSE_EVENT,
         data: {
           id: rpcRequestPayload.id,
@@ -1240,7 +1397,7 @@ export class SecureServer {
     } catch (error) {
       const normalizedError = normalizeToError(error, "Server ACK request handler failed.");
 
-      this.sendEncryptedEnvelope(client.socket, {
+      await this.sendEncryptedEnvelope(client.socket, {
         event: INTERNAL_RPC_RESPONSE_EVENT,
         data: {
           id: rpcRequestPayload.id,
@@ -1334,7 +1491,7 @@ export class SecureServer {
   private sendInternalHandshake(socket: WebSocket, localPublicKey: string): void {
     this.sendRaw(
       socket,
-      serializeEnvelope(INTERNAL_HANDSHAKE_EVENT, {
+      serializePlainEnvelope(INTERNAL_HANDSHAKE_EVENT, {
         publicKey: localPublicKey
       })
     );
@@ -1372,13 +1529,13 @@ export class SecureServer {
     return this.handshakeStateBySocket.get(socket)?.isReady ?? false;
   }
 
-  private sendOrQueuePayload(socket: WebSocket, envelope: SecureEnvelope): void {
+  private sendOrQueuePayload(socket: WebSocket, envelope: SecureEnvelope): Promise<void> {
     if (!this.isClientHandshakeReady(socket)) {
       this.queuePayload(socket, envelope);
-      return;
+      return Promise.resolve();
     }
 
-    this.sendEncryptedEnvelope(socket, envelope);
+    return this.sendEncryptedEnvelope(socket, envelope);
   }
 
   private queuePayload(socket: WebSocket, envelope: SecureEnvelope): void {
@@ -1387,7 +1544,7 @@ export class SecureServer {
     this.pendingPayloadsBySocket.set(socket, pendingPayloads);
   }
 
-  private flushQueuedPayloads(socket: WebSocket): void {
+  private async flushQueuedPayloads(socket: WebSocket): Promise<void> {
     const pendingPayloads = this.pendingPayloadsBySocket.get(socket);
 
     if (!pendingPayloads || pendingPayloads.length === 0) {
@@ -1397,7 +1554,7 @@ export class SecureServer {
     this.pendingPayloadsBySocket.delete(socket);
 
     for (const envelope of pendingPayloads) {
-      this.sendEncryptedEnvelope(socket, envelope);
+      await this.sendEncryptedEnvelope(socket, envelope);
     }
   }
 
@@ -1553,7 +1710,9 @@ export class SecureServer {
         continue;
       }
 
-      this.sendOrQueuePayload(client.socket, envelope);
+        void this.sendOrQueuePayload(client.socket, envelope).catch(() => {
+          return undefined;
+        });
     }
   }
 }
@@ -1804,7 +1963,9 @@ export class SecureClient {
         return true;
       }
 
-      this.sendEncryptedEnvelope(envelope);
+      void this.sendEncryptedEnvelope(envelope).catch(() => {
+        return undefined;
+      });
       return true;
     } catch (error) {
       const normalizedError = normalizeToError(error, "Failed to emit client event.");
@@ -2116,26 +2277,29 @@ export class SecureClient {
     }
   }
 
-  private sendEncryptedEnvelope(envelope: SecureEnvelope): void {
+  private async sendEncryptedEnvelope(envelope: SecureEnvelope): Promise<void> {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      const socketStateError = new Error("Client socket is not connected.");
+      this.notifyError(socketStateError);
+      throw socketStateError;
+    }
+
+    const encryptionKey = this.handshakeState?.encryptionKey;
+
+    if (!encryptionKey) {
+      const missingKeyError = new Error("Missing encryption key for client payload encryption.");
+      this.notifyError(missingKeyError);
+      throw missingKeyError;
+    }
+
     try {
-      if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-        throw new Error("Client socket is not connected.");
-      }
-
-      const encryptionKey = this.handshakeState?.encryptionKey;
-
-      if (!encryptionKey) {
-        throw new Error("Missing encryption key for client payload encryption.");
-      }
-
-      const encryptedPayload = encryptSerializedEnvelope(
-        serializeEnvelope(envelope.event, envelope.data),
-        encryptionKey
-      );
-
+      const serializedEnvelope = await serializeEnvelope(envelope.event, envelope.data);
+      const encryptedPayload = encryptSerializedEnvelope(serializedEnvelope, encryptionKey);
       this.socket.send(encryptedPayload);
     } catch (error) {
-      this.notifyError(normalizeToError(error, "Failed to send encrypted client payload."));
+      const normalizedError = normalizeToError(error, "Failed to send encrypted client payload.");
+      this.notifyError(normalizedError);
+      throw normalizedError;
     }
   }
 
@@ -2178,7 +2342,13 @@ export class SecureClient {
         return;
       }
 
-      this.sendEncryptedEnvelope(rpcRequestEnvelope);
+      void this.sendEncryptedEnvelope(rpcRequestEnvelope).catch((error) => {
+        clearTimeout(timeoutHandle);
+        this.pendingRpcRequests.delete(requestId);
+        reject(
+          normalizeToError(error, `Failed to dispatch ACK request for event "${event}".`)
+        );
+      });
     });
   }
 
@@ -2223,7 +2393,7 @@ export class SecureClient {
         rpcRequestPayload.data
       );
 
-      this.sendEncryptedEnvelope({
+      await this.sendEncryptedEnvelope({
         event: INTERNAL_RPC_RESPONSE_EVENT,
         data: {
           id: rpcRequestPayload.id,
@@ -2234,7 +2404,7 @@ export class SecureClient {
     } catch (error) {
       const normalizedError = normalizeToError(error, "Client ACK request handler failed.");
 
-      this.sendEncryptedEnvelope({
+      await this.sendEncryptedEnvelope({
         event: INTERNAL_RPC_RESPONSE_EVENT,
         data: {
           id: rpcRequestPayload.id,
@@ -2290,7 +2460,7 @@ export class SecureClient {
       }
 
       this.socket.send(
-        serializeEnvelope(INTERNAL_HANDSHAKE_EVENT, {
+        serializePlainEnvelope(INTERNAL_HANDSHAKE_EVENT, {
           publicKey: this.handshakeState.localPublicKey
         })
       );
@@ -2318,7 +2488,7 @@ export class SecureClient {
       this.handshakeState.encryptionKey = deriveEncryptionKey(sharedSecret);
       this.handshakeState.isReady = true;
 
-      this.flushPendingPayloadQueue();
+      void this.flushPendingPayloadQueue();
       this.notifyReady();
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to complete client handshake."));
@@ -2329,7 +2499,7 @@ export class SecureClient {
     return this.handshakeState?.isReady ?? false;
   }
 
-  private flushPendingPayloadQueue(): void {
+  private async flushPendingPayloadQueue(): Promise<void> {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN || !this.isHandshakeReady()) {
       return;
     }
@@ -2338,7 +2508,7 @@ export class SecureClient {
     this.pendingPayloadQueue = [];
 
     for (const envelope of pendingPayloads) {
-      this.sendEncryptedEnvelope(envelope);
+      await this.sendEncryptedEnvelope(envelope);
     }
   }
 }

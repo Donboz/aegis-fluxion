@@ -533,6 +533,169 @@ describe("SecureServer and SecureClient encryption flow", () => {
     }
   });
 
+  it("transfers Buffer payloads over encrypted channel without mutation", async () => {
+    const port = await getFreePort();
+    const server = new SecureServer({ port, host: "127.0.0.1" });
+    const client = new SecureClient(`ws://127.0.0.1:${port}`);
+    const sourcePayload = randomBytes(128);
+
+    try {
+      await Promise.all([
+        withTimeout(
+          new Promise<void>((resolve) => {
+            server.on("ready", () => {
+              resolve();
+            });
+          }),
+          TEST_TIMEOUT_MS,
+          "server ready for binary buffer test"
+        ),
+        withTimeout(
+          new Promise<void>((resolve) => {
+            client.on("ready", () => {
+              resolve();
+            });
+          }),
+          TEST_TIMEOUT_MS,
+          "client ready for binary buffer test"
+        )
+      ]);
+
+      const serverReceivedPromise = withTimeout(
+        new Promise<void>((resolve, reject) => {
+          server.on("binary:ingest", (payload, serverClient) => {
+            try {
+              expect(Buffer.isBuffer(payload)).toBe(true);
+              expect((payload as Buffer).equals(sourcePayload)).toBe(true);
+              server.emitTo(serverClient.id, "binary:echo", payload);
+              resolve();
+            } catch (error) {
+              reject(error);
+            }
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "server receive binary buffer"
+      );
+
+      const clientEchoPromise = withTimeout(
+        new Promise<unknown>((resolve) => {
+          client.on("binary:echo", (payload) => {
+            resolve(payload);
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "client binary echo"
+      );
+
+      expect(client.emit("binary:ingest", sourcePayload)).toBe(true);
+
+      await serverReceivedPromise;
+
+      const echoedPayload = await clientEchoPromise;
+
+      expect(Buffer.isBuffer(echoedPayload)).toBe(true);
+      expect((echoedPayload as Buffer).equals(sourcePayload)).toBe(true);
+    } finally {
+      client.disconnect();
+      server.close();
+      await wait(30);
+    }
+  });
+
+  it("supports Buffer, Uint8Array and Blob in encrypted ACK roundtrip", async () => {
+    const port = await getFreePort();
+    const server = new SecureServer({ port, host: "127.0.0.1" });
+    const client = new SecureClient(`ws://127.0.0.1:${port}`);
+
+    const sourceBuffer = Buffer.from("binary-buffer-payload", "utf8");
+    const sourceUint8Array = Uint8Array.from([1, 3, 5, 7, 9, 11, 13]);
+    const sourceBlob = new Blob([Buffer.from("binary-blob-payload", "utf8")], {
+      type: "application/octet-stream"
+    });
+
+    try {
+      const sourceBlobBuffer = Buffer.from(await sourceBlob.arrayBuffer());
+
+      server.on("binary:mixed", async (payload) => {
+        const parsedPayload = payload as {
+          buffer: Buffer;
+          bytes: Uint8Array;
+          blob: Blob;
+        };
+
+        expect(Buffer.isBuffer(parsedPayload.buffer)).toBe(true);
+        expect(parsedPayload.buffer.equals(sourceBuffer)).toBe(true);
+        expect(parsedPayload.bytes).toBeInstanceOf(Uint8Array);
+        expect(Buffer.from(parsedPayload.bytes).equals(Buffer.from(sourceUint8Array))).toBe(true);
+        expect(parsedPayload.blob).toBeInstanceOf(Blob);
+
+        const receivedBlobBuffer = Buffer.from(await parsedPayload.blob.arrayBuffer());
+        expect(receivedBlobBuffer.equals(sourceBlobBuffer)).toBe(true);
+
+        return {
+          buffer: parsedPayload.buffer,
+          bytes: parsedPayload.bytes,
+          blob: parsedPayload.blob
+        };
+      });
+
+      await Promise.all([
+        withTimeout(
+          new Promise<void>((resolve) => {
+            server.on("ready", () => {
+              resolve();
+            });
+          }),
+          TEST_TIMEOUT_MS,
+          "server ready for mixed binary ACK"
+        ),
+        withTimeout(
+          new Promise<void>((resolve) => {
+            client.on("ready", () => {
+              resolve();
+            });
+          }),
+          TEST_TIMEOUT_MS,
+          "client ready for mixed binary ACK"
+        )
+      ]);
+
+      const ackResponse = await withTimeout(
+        client.emit(
+          "binary:mixed",
+          {
+            buffer: sourceBuffer,
+            bytes: sourceUint8Array,
+            blob: sourceBlob
+          },
+          { timeoutMs: 1200 }
+        ) as Promise<unknown>,
+        TEST_TIMEOUT_MS,
+        "mixed binary ACK response"
+      );
+
+      const parsedAckResponse = ackResponse as {
+        buffer: Buffer;
+        bytes: Uint8Array;
+        blob: Blob;
+      };
+
+      expect(Buffer.isBuffer(parsedAckResponse.buffer)).toBe(true);
+      expect(parsedAckResponse.buffer.equals(sourceBuffer)).toBe(true);
+      expect(parsedAckResponse.bytes).toBeInstanceOf(Uint8Array);
+      expect(Buffer.from(parsedAckResponse.bytes).equals(Buffer.from(sourceUint8Array))).toBe(true);
+      expect(parsedAckResponse.blob).toBeInstanceOf(Blob);
+
+      const ackBlobBuffer = Buffer.from(await parsedAckResponse.blob.arrayBuffer());
+      expect(ackBlobBuffer.equals(sourceBlobBuffer)).toBe(true);
+    } finally {
+      client.disconnect();
+      server.close();
+      await wait(30);
+    }
+  });
+
   it("times out client ACK requests when server handler never resolves", async () => {
     const port = await getFreePort();
     const server = new SecureServer({ port, host: "127.0.0.1" });

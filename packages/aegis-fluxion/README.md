@@ -2,8 +2,10 @@
 
 Main end-user package for the `aegis-fluxion` secure messaging toolkit.
 
-This package re-exports the full public API from `@aegis-fluxion/core` (including
-`SecureServer`, `SecureClient`, `SecureServerClient`, and related types).
+This package re-exports the full public API from `@aegis-fluxion/core`, including
+`SecureServer`, `SecureClient`, and all related types.
+
+Version: **0.5.0**
 
 ---
 
@@ -15,37 +17,70 @@ npm install aegis-fluxion ws
 
 ---
 
-## Quick Start
+## Why `aegis-fluxion`
+
+- ECDH + AES-256-GCM encrypted transport
+- Encrypted ACK request/response with timeout control
+- Room-based secure fanout
+- Heartbeat cleanup + reconnect resilience
+- **Binary support out of the box** (`Buffer`, `Uint8Array`, `Blob`)
+
+---
+
+## Quick Start (Binary Upload Metadata)
 
 ```ts
-import { SecureServer, SecureClient } from "aegis-fluxion";
+import { SecureClient, SecureServer } from "aegis-fluxion";
 
 const server = new SecureServer({ host: "127.0.0.1", port: 8080 });
-
-server.on("profile:get", ({ id }) => {
-  return { id, role: "operator" };
-});
-
 const client = new SecureClient("ws://127.0.0.1:8080");
 
+server.on("file:upload", async (payload) => {
+  const { name, chunk, previewBlob } = payload as {
+    name: string;
+    chunk: Uint8Array;
+    previewBlob: Blob;
+  };
+
+  return {
+    name,
+    chunkBytes: chunk.byteLength,
+    previewBytes: previewBlob.size
+  };
+});
+
 client.on("ready", async () => {
-  const profile = await client.emit(
-    "profile:get",
-    { id: "u-42" },
-    { timeoutMs: 1500 }
+  const response = await client.emit(
+    "file:upload",
+    {
+      name: "avatar.png",
+      chunk: Uint8Array.from([137, 80, 78, 71]),
+      previewBlob: new Blob([Buffer.from("tiny-preview")], {
+        type: "image/png"
+      })
+    },
+    { timeoutMs: 2000 }
   );
 
-  console.log(profile);
+  console.log(response);
 });
 ```
 
-Callback-style ACK usage:
+---
+
+## Callback-style ACK Example
 
 ```ts
 client.emit(
-  "profile:get",
-  { id: "u-7" },
-  { timeoutMs: 1500 },
+  "file:upload",
+  {
+    name: "report.bin",
+    chunk: Buffer.from("01020304", "hex"),
+    previewBlob: new Blob([Buffer.from("ok")], {
+      type: "application/octet-stream"
+    })
+  },
+  { timeoutMs: 2000 },
   (error, response) => {
     if (error) {
       console.error(error.message);
@@ -59,19 +94,17 @@ client.emit(
 
 ---
 
-## Capabilities
+## Binary Payload Notes
 
-- ECDH key exchange + AES-256-GCM encrypted transport
-- Secure room fanout routing
-- Heartbeat-based stale socket cleanup
-- Auto-reconnect with exponential backoff
-- Encrypted ACK request/response with timeout control
+- Binary integrity is protected by AES-GCM authentication tags.
+- Payload type is preserved across encrypted transport.
+- Mixed payloads (JSON + binary) are supported.
 
 ---
 
 ## Related Docs
 
-- Core technical docs: [`../core/README.md`](../core/README.md)
+- Core package docs: [`../core/README.md`](../core/README.md)
 - Repository changelog: [`../../CHANGELOG.md`](../../CHANGELOG.md)
 
 ---

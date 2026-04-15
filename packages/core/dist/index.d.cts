@@ -5,6 +5,7 @@ interface SecureEnvelope<TData = unknown> {
     event: string;
     data: TData;
 }
+type SecureBinaryPayload = Buffer | Uint8Array | Blob;
 interface SecureAckOptions {
     timeoutMs?: number;
 }
@@ -199,4 +200,4 @@ declare class SecureClient {
     private flushPendingPayloadQueue;
 }
 
-export { type SecureAckCallback, type SecureAckOptions, SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureClientReconnectOptions, type SecureEnvelope, type SecureErrorHandler, SecureServer, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerHeartbeatOptions, type SecureServerLifecycleEvent, type SecureServerOptions, type SecureServerReadyHandler, type SecureServerRoomOperator };
+export { type SecureAckCallback, type SecureAckOptions, type SecureBinaryPayload, SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureClientReconnectOptions, type SecureEnvelope, type SecureErrorHandler, SecureServer, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerHeartbeatOptions, type SecureServerLifecycleEvent, type SecureServerOptions, type SecureServerReadyHandler, type SecureServerRoomOperator };

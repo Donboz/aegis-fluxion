@@ -7,6 +7,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-04-15
+
+### Added
+
+- Native binary payload support over encrypted channels for `Buffer`, `Uint8Array`, and `Blob` values.
+- Recursive binary serialization for nested payloads so mixed JSON + binary objects are supported in both event and ACK flows.
+- Binary transport integration tests for direct emit and encrypted ACK roundtrip scenarios.
+
+### Changed
+
+- Internal envelope serialization pipeline is now async-aware to support binary sources that require asynchronous extraction (for example `Blob`).
+- Secure client/server encrypted send paths were updated to preserve payload type fidelity after decryption.
+
+### Security
+
+- Binary payloads are still protected end-to-end with the existing ECDH-derived AES-256-GCM channel.
+- AES-GCM authentication continues to provide tamper detection for binary packets exactly as with JSON payloads.
+
 ## [0.4.0] - 2026-04-15
 
 ### Added
