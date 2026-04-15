@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createECDH, randomBytes } from "node:crypto";
 import { createServer } from "node:net";
 import WebSocket from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -1106,6 +1106,154 @@ describe("SecureServer and SecureClient encryption flow", () => {
         }
       });
       expect(client.isConnected()).toBe(true);
+    } finally {
+      client.disconnect();
+      server.close();
+      await wait(30);
+    }
+  });
+
+  it("resumes secure session with cached ticket and skips extra ECDH computeSecret", async () => {
+    const port = await getFreePort();
+    const server = new SecureServer({
+      port,
+      host: "127.0.0.1",
+      sessionResumption: {
+        enabled: true,
+        ticketTtlMs: 60_000,
+        maxCachedTickets: 256
+      }
+    });
+
+    const client = new SecureClient(`ws://127.0.0.1:${port}`, {
+      reconnect: false,
+      sessionResumption: {
+        enabled: true,
+        maxAcceptedTicketTtlMs: 60_000
+      }
+    });
+
+    const ecdhPrototype = Object.getPrototypeOf(createECDH("prime256v1")) as {
+      computeSecret: (...args: unknown[]) => Buffer;
+    };
+
+    const computeSecretSpy = vi.spyOn(ecdhPrototype, "computeSecret");
+
+    try {
+      const firstServerReadyPromise = withTimeout(
+        new Promise<void>((resolve) => {
+          server.on("ready", () => {
+            resolve();
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "first server ready for resume test"
+      );
+
+      const firstClientReadyPromise = withTimeout(
+        new Promise<void>((resolve) => {
+          client.on("ready", () => {
+            resolve();
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "first client ready for resume test"
+      );
+
+      await Promise.all([firstServerReadyPromise, firstClientReadyPromise]);
+
+      const computeSecretCallsAfterInitialHandshake = computeSecretSpy.mock.calls.length;
+
+      expect(computeSecretCallsAfterInitialHandshake).toBeGreaterThanOrEqual(2);
+
+      await withTimeout(
+        new Promise<void>((resolve) => {
+          const ensureTicketCached = (): void => {
+            if ((client as unknown as { sessionTicket?: unknown }).sessionTicket) {
+              resolve();
+              return;
+            }
+
+            setTimeout(ensureTicketCached, 10);
+          };
+
+          ensureTicketCached();
+        }),
+        TEST_TIMEOUT_MS,
+        "session ticket cache population"
+      );
+
+      const disconnectPromise = withTimeout(
+        new Promise<void>((resolve) => {
+          client.on("disconnect", () => {
+            resolve();
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "manual disconnect before resume"
+      );
+
+      client.disconnect();
+      await disconnectPromise;
+      await wait(40);
+
+      const secondServerReadyPromise = withTimeout(
+        new Promise<void>((resolve) => {
+          server.on("ready", () => {
+            resolve();
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "second server ready for resume test"
+      );
+
+      const secondClientReadyPromise = withTimeout(
+        new Promise<void>((resolve) => {
+          client.on("ready", () => {
+            resolve();
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "second client ready for resume test"
+      );
+
+      client.connect();
+
+      await Promise.all([secondServerReadyPromise, secondClientReadyPromise]);
+
+      const computeSecretCallsAfterResume = computeSecretSpy.mock.calls.length;
+      expect(computeSecretCallsAfterResume).toBe(
+        computeSecretCallsAfterInitialHandshake
+      );
+
+      const internalHandshakeState = (
+        client as unknown as {
+          handshakeState?: {
+            resumeAttempt?: {
+              status?: string;
+            } | null;
+          };
+        }
+      ).handshakeState;
+
+      expect(internalHandshakeState?.resumeAttempt?.status).toBe("accepted");
+
+      server.on("resume:probe", (payload, serverClient) => {
+        serverClient.emit("resume:ack", payload);
+      });
+
+      const ackPayloadPromise = withTimeout(
+        new Promise<unknown>((resolve) => {
+          client.on("resume:ack", (payload) => {
+            resolve(payload);
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "resume transport ack"
+      );
+
+      expect(client.emit("resume:probe", { probe: "resumed" })).toBe(true);
+      expect(await ackPayloadPromise).toEqual({ probe: "resumed" });
     } finally {
       client.disconnect();
       server.close();

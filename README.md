@@ -1,6 +1,6 @@
 # aegis-fluxion
 
-![Version](https://img.shields.io/badge/version-0.7.2-2563eb)
+![Version](https://img.shields.io/badge/version-0.7.3-2563eb)
 ![Node](https://img.shields.io/badge/node-%3E%3D18.18.0-16a34a)
 ![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178c6)
 ![Crypto](https://img.shields.io/badge/Crypto-ECDH%20%2B%20AES--256--GCM-0f172a)
@@ -8,8 +8,8 @@
 `aegis-fluxion` is an end-to-end encrypted WebSocket toolkit for Node.js and TypeScript.
 
 It provides secure event transport with ephemeral ECDH key exchange, AES-256-GCM envelopes,
-ACK request/response semantics, binary payload support, middleware-based policy controls,
-and horizontal scaling through Redis Pub/Sub adapters.
+TLS 1.3-style session resumption, ACK request/response semantics, binary payload support,
+middleware-based policy controls, and horizontal scaling through Redis Pub/Sub adapters.
 
 ---
 
@@ -24,17 +24,12 @@ and horizontal scaling through Redis Pub/Sub adapters.
 
 ---
 
-## What's new in 0.7.2
+## What's new in 0.7.3
 
-- Added **horizontal scaling support** with `@aegis-fluxion/redis-adapter`.
-- `SecureServer` now supports adapter hooks for cross-instance replication:
-  - constructor `adapter` option
-  - `setAdapter(...)`
-  - `handleAdapterMessage(...)`
-  - `serverId` getter for origin-aware relay filtering
-- Cluster replication now supports:
-  - global broadcasts (`server.emit(...)`)
-  - room broadcasts (`server.to(room).emit(...)`)
+- Added TLS 1.3-style **session resumption** to secure reconnect flows.
+- Clients can attempt resume-first handshakes and automatically fall back to full ECDH.
+- Servers now issue encrypted one-time session tickets with configurable TTL and cache limits.
+- Umbrella package now targets `@aegis-fluxion/core@^0.8.0`.
 
 ---
 
@@ -97,6 +92,39 @@ client.on("ready", async () => {
 
 ---
 
+## Session resumption example
+
+```ts
+import { SecureClient, SecureServer } from "aegis-fluxion";
+
+const server = new SecureServer({
+  host: "127.0.0.1",
+  port: 8080,
+  sessionResumption: {
+    enabled: true,
+    ticketTtlMs: 60_000,
+    maxCachedTickets: 2_048
+  }
+});
+
+const client = new SecureClient("ws://127.0.0.1:8080", {
+  reconnect: true,
+  sessionResumption: {
+    enabled: true,
+    maxAcceptedTicketTtlMs: 60_000
+  }
+});
+
+client.on("ready", () => {
+  console.log("Secure channel ready (full handshake or resumed handshake).");
+});
+```
+
+When a valid ticket is cached, reconnects can skip extra ECDH secret recomputation and
+resume directly with authenticated resume proofs.
+
+---
+
 ## Horizontal scaling with Redis
 
 ```ts
@@ -137,6 +165,7 @@ serverA.to("ops").emit("ops:alert", {
 - Ephemeral ECDH handshake (`prime256v1`)
 - AES-256-GCM authenticated encryption for all application payloads
 - Binary payload support (`Buffer`, `Uint8Array`, `Blob`)
+- TLS 1.3-style session resumption with encrypted one-time tickets
 - ACK request/response with timeout controls
 - Rate limiting and DDoS controls (per connection + per IP)
 - Heartbeat zombie cleanup and reconnect backoff handling

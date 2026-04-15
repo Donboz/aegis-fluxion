@@ -7,6 +7,37 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.3] - 2026-04-15
+
+### Added
+
+- TLS 1.3-style secure **session resumption** for encrypted channels.
+- New resumption handshake frames and protocol typing:
+  - `hello`
+  - `resume`
+  - `resume-ack`
+- One-time secure session tickets delivered over encrypted internal frames.
+- New server session resumption controls:
+  - `sessionResumption.enabled`
+  - `sessionResumption.ticketTtlMs`
+  - `sessionResumption.maxCachedTickets`
+- New client session resumption controls:
+  - `sessionResumption` (boolean or object)
+  - `sessionResumption.maxAcceptedTicketTtlMs`
+- Integration coverage validating reconnect resumption and reduced ECDH recomputation.
+
+### Changed
+
+- `@aegis-fluxion/core` bumped from `0.7.2` to `0.8.0` (feature release).
+- Umbrella package `aegis-fluxion` patch-bumped from `0.7.2` to `0.7.3`.
+- Root monorepo version synchronized to `0.7.3` to match the umbrella package.
+- Umbrella dependency updated to `@aegis-fluxion/core@^0.8.0`.
+
+### Security
+
+- Resume proofs now use HMAC-based validation with constant-time comparison to reduce oracle risk.
+- Session tickets are time-bound, cache-limited, and single-use on successful resume.
+
 ## [0.7.2] - 2026-04-15
 
 ### Added

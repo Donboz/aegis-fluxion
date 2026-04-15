@@ -2,7 +2,7 @@
 
 Low-level encrypted WebSocket primitives for the `aegis-fluxion` ecosystem.
 
-Version: **0.7.2**
+Version: **0.8.0**
 
 ---
 
@@ -14,6 +14,7 @@ Version: **0.7.2**
 - Secure room routing (`join`, `leave`, `leaveAll`, `to(room).emit(...)`)
 - Middleware phases: `connection`, `incoming`, `outgoing`
 - Rate limiting and DDoS controls per connection and IP
+- TLS 1.3-style session resumption with encrypted one-time tickets
 - **Horizontal scaling hooks** via pluggable `SecureServerAdapter`
 
 ---
@@ -23,6 +24,55 @@ Version: **0.7.2**
 ```bash
 npm install @aegis-fluxion/core ws
 ```
+
+---
+
+## Session resumption (TLS 1.3-style)
+
+`@aegis-fluxion/core@0.8.0` introduces secure resume-first reconnect behavior:
+
+- Full handshake path uses ephemeral ECDH (`hello` frame).
+- Resume path uses ticket-bound proofs (`resume` / `resume-ack` frames).
+- Successful resumes derive fresh channel keys from ticket secret + client nonce.
+- Servers enforce ticket TTL, bounded cache size, and one-time ticket consumption.
+- Clients automatically fall back to full handshake when resume is rejected.
+
+### Server configuration
+
+```ts
+import { SecureServer } from "@aegis-fluxion/core";
+
+const server = new SecureServer({
+  host: "127.0.0.1",
+  port: 8080,
+  sessionResumption: {
+    enabled: true,
+    ticketTtlMs: 60_000,
+    maxCachedTickets: 10_000
+  }
+});
+```
+
+### Client configuration
+
+```ts
+import { SecureClient } from "@aegis-fluxion/core";
+
+const client = new SecureClient("ws://127.0.0.1:8080", {
+  reconnect: true,
+  sessionResumption: {
+    enabled: true,
+    maxAcceptedTicketTtlMs: 60_000
+  }
+});
+```
+
+### Security model
+
+- Resume proofs are validated with HMAC and constant-time comparison.
+- Resume tickets are encrypted in transit (same channel protections as all payloads).
+- Resume tickets are discarded if expired, policy-invalid, or already consumed.
+- Reserved internal events (e.g., session-ticket transport) cannot be emitted by user code.
 
 ---
 

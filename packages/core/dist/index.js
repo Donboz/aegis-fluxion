@@ -1,4 +1,4 @@
-import { randomUUID, createDecipheriv, randomBytes, createCipheriv, createECDH, createHash } from 'crypto';
+import { randomUUID, randomBytes, createHmac, createDecipheriv, createCipheriv, createECDH, timingSafeEqual, createHash } from 'crypto';
 import WebSocket, { WebSocketServer } from 'ws';
 
 // src/index.ts
@@ -7,20 +7,27 @@ var DEFAULT_CLOSE_REASON = "";
 var POLICY_VIOLATION_CLOSE_CODE = 1008;
 var POLICY_VIOLATION_CLOSE_REASON = "Connection rejected by middleware.";
 var INTERNAL_HANDSHAKE_EVENT = "__handshake";
+var INTERNAL_SESSION_TICKET_EVENT = "__session:ticket";
 var INTERNAL_RPC_REQUEST_EVENT = "__rpc:req";
 var INTERNAL_RPC_RESPONSE_EVENT = "__rpc:res";
 var READY_EVENT = "ready";
 var HANDSHAKE_CURVE = "prime256v1";
+var HANDSHAKE_PROTOCOL_VERSION = 1;
 var ENCRYPTION_ALGORITHM = "aes-256-gcm";
 var GCM_IV_LENGTH = 12;
 var GCM_AUTH_TAG_LENGTH = 16;
 var ENCRYPTION_KEY_LENGTH = 32;
 var ENCRYPTED_PACKET_VERSION = 1;
 var ENCRYPTED_PACKET_PREFIX_LENGTH = 1 + GCM_IV_LENGTH + GCM_AUTH_TAG_LENGTH;
+var SESSION_TICKET_VERSION = 1;
 var BINARY_PAYLOAD_MARKER = "__afxBinaryPayload";
 var BINARY_PAYLOAD_VERSION = 1;
 var DEFAULT_HEARTBEAT_INTERVAL_MS = 15e3;
 var DEFAULT_HEARTBEAT_TIMEOUT_MS = 15e3;
+var DEFAULT_SESSION_RESUMPTION_ENABLED = true;
+var DEFAULT_SESSION_TICKET_TTL_MS = 10 * 6e4;
+var DEFAULT_SESSION_TICKET_MAX_CACHE_SIZE = 1e4;
+var RESUMPTION_NONCE_LENGTH = 16;
 var DEFAULT_RECONNECT_INITIAL_DELAY_MS = 250;
 var DEFAULT_RECONNECT_MAX_DELAY_MS = 1e4;
 var DEFAULT_RECONNECT_FACTOR = 2;
@@ -242,7 +249,7 @@ function decodeCloseReason(reason) {
   return reason.toString("utf8");
 }
 function isReservedEmitEvent(event) {
-  return event === INTERNAL_HANDSHAKE_EVENT || event === INTERNAL_RPC_REQUEST_EVENT || event === INTERNAL_RPC_RESPONSE_EVENT || event === READY_EVENT;
+  return event === INTERNAL_HANDSHAKE_EVENT || event === INTERNAL_SESSION_TICKET_EVENT || event === INTERNAL_RPC_REQUEST_EVENT || event === INTERNAL_RPC_RESPONSE_EVENT || event === READY_EVENT;
 }
 function isPromiseLike(value) {
   return typeof value === "object" && value !== null && "then" in value;
@@ -333,16 +340,149 @@ function createEphemeralHandshakeState() {
     localPublicKey: ecdh.getPublicKey("base64")
   };
 }
+function decodeBase64ToBuffer(value, fieldName) {
+  if (typeof value !== "string") {
+    throw new Error(`${fieldName} must be a base64 string.`);
+  }
+  const normalizedValue = value.trim();
+  if (normalizedValue.length === 0) {
+    throw new Error(`${fieldName} must be a non-empty base64 string.`);
+  }
+  const decodedBuffer = Buffer.from(normalizedValue, "base64");
+  if (decodedBuffer.length === 0) {
+    throw new Error(`${fieldName} could not be decoded from base64.`);
+  }
+  const canonicalInput = normalizedValue.replace(/=+$/u, "");
+  const canonicalDecoded = decodedBuffer.toString("base64").replace(/=+$/u, "");
+  if (canonicalInput !== canonicalDecoded) {
+    throw new Error(`${fieldName} is not valid base64 content.`);
+  }
+  return decodedBuffer;
+}
+function equalsConstantTime(left, right) {
+  if (left.length !== right.length) {
+    return false;
+  }
+  return timingSafeEqual(left, right);
+}
+function createResumeClientProof(sessionSecret, sessionId, clientNonce) {
+  return createHmac("sha256", sessionSecret).update("afx-resume-client-proof:v1").update(sessionId).update(clientNonce).digest();
+}
+function createResumeServerProof(resumedKey, sessionId, clientNonce) {
+  return createHmac("sha256", resumedKey).update("afx-resume-server-proof:v1").update(sessionId).update(clientNonce).digest();
+}
+function deriveSessionTicketSecret(baseKey) {
+  return createHmac("sha256", baseKey).update("afx-session-ticket:v1").digest();
+}
+function deriveResumedEncryptionKey(sessionSecret, clientNonce) {
+  const derivedKey = createHash("sha256").update("afx-resume-encryption-key:v1").update(sessionSecret).update(clientNonce).digest();
+  if (derivedKey.length !== ENCRYPTION_KEY_LENGTH) {
+    throw new Error("Failed to derive a valid resumed AES-256 key.");
+  }
+  return derivedKey;
+}
 function parseHandshakePayload(data) {
   if (typeof data !== "object" || data === null) {
     throw new Error("Invalid handshake payload format.");
   }
   const payload = data;
-  if (typeof payload.publicKey !== "string" || payload.publicKey.length === 0) {
-    throw new Error("Handshake payload must include a non-empty public key.");
+  if (typeof payload.type !== "string") {
+    if (typeof payload.publicKey === "string" && payload.publicKey.length > 0) {
+      return {
+        type: "hello",
+        protocolVersion: HANDSHAKE_PROTOCOL_VERSION,
+        publicKey: payload.publicKey
+      };
+    }
+    throw new Error("Handshake payload must include a valid type.");
+  }
+  const protocolVersion = payload.protocolVersion === void 0 ? HANDSHAKE_PROTOCOL_VERSION : payload.protocolVersion;
+  if (protocolVersion !== HANDSHAKE_PROTOCOL_VERSION) {
+    throw new Error(
+      `Unsupported handshake protocol version: ${String(protocolVersion)}.`
+    );
+  }
+  if (payload.type === "hello") {
+    if (typeof payload.publicKey !== "string" || payload.publicKey.length === 0) {
+      throw new Error("Handshake hello payload must include a non-empty public key.");
+    }
+    return {
+      type: "hello",
+      protocolVersion: HANDSHAKE_PROTOCOL_VERSION,
+      publicKey: payload.publicKey
+    };
+  }
+  if (payload.type === "resume") {
+    if (typeof payload.sessionId !== "string" || payload.sessionId.trim().length === 0) {
+      throw new Error("Handshake resume payload must include a non-empty sessionId.");
+    }
+    if (typeof payload.clientNonce !== "string" || payload.clientNonce.length === 0) {
+      throw new Error("Handshake resume payload must include a non-empty clientNonce.");
+    }
+    if (typeof payload.clientProof !== "string" || payload.clientProof.length === 0) {
+      throw new Error("Handshake resume payload must include a non-empty clientProof.");
+    }
+    return {
+      type: "resume",
+      protocolVersion: HANDSHAKE_PROTOCOL_VERSION,
+      sessionId: payload.sessionId.trim(),
+      clientNonce: payload.clientNonce,
+      clientProof: payload.clientProof
+    };
+  }
+  if (payload.type === "resume-ack") {
+    if (typeof payload.ok !== "boolean") {
+      throw new Error("Handshake resume-ack payload must include boolean ok.");
+    }
+    const normalizedPayload = {
+      type: "resume-ack",
+      protocolVersion: HANDSHAKE_PROTOCOL_VERSION,
+      ok: payload.ok
+    };
+    if (typeof payload.sessionId === "string" && payload.sessionId.trim().length > 0) {
+      normalizedPayload.sessionId = payload.sessionId.trim();
+    }
+    if (typeof payload.serverProof === "string" && payload.serverProof.length > 0) {
+      normalizedPayload.serverProof = payload.serverProof;
+    }
+    if (typeof payload.reason === "string" && payload.reason.trim().length > 0) {
+      normalizedPayload.reason = payload.reason.trim();
+    }
+    return normalizedPayload;
+  }
+  throw new Error(`Unsupported handshake payload type: ${payload.type}.`);
+}
+function parseSessionTicketPayload(data) {
+  if (typeof data !== "object" || data === null) {
+    throw new Error("Invalid session ticket payload format.");
+  }
+  const payload = data;
+  if (payload.version !== SESSION_TICKET_VERSION) {
+    throw new Error(
+      `Unsupported session ticket payload version: ${String(payload.version)}.`
+    );
+  }
+  if (typeof payload.sessionId !== "string" || payload.sessionId.trim().length === 0) {
+    throw new Error("Session ticket payload must include a non-empty sessionId.");
+  }
+  if (typeof payload.secret !== "string" || payload.secret.length === 0) {
+    throw new Error("Session ticket payload must include a non-empty secret.");
+  }
+  if (typeof payload.issuedAt !== "number" || !Number.isFinite(payload.issuedAt)) {
+    throw new Error("Session ticket payload issuedAt must be a finite number.");
+  }
+  if (typeof payload.expiresAt !== "number" || !Number.isFinite(payload.expiresAt)) {
+    throw new Error("Session ticket payload expiresAt must be a finite number.");
+  }
+  if (payload.expiresAt <= payload.issuedAt) {
+    throw new Error("Session ticket payload expiresAt must be greater than issuedAt.");
   }
   return {
-    publicKey: payload.publicKey
+    version: SESSION_TICKET_VERSION,
+    sessionId: payload.sessionId.trim(),
+    secret: payload.secret,
+    issuedAt: payload.issuedAt,
+    expiresAt: payload.expiresAt
   };
 }
 function deriveEncryptionKey(sharedSecret) {
@@ -412,6 +552,7 @@ var SecureServer = class {
   adapter = null;
   heartbeatConfig;
   rateLimitConfig;
+  sessionResumptionConfig;
   heartbeatIntervalHandle = null;
   clientsById = /* @__PURE__ */ new Map();
   clientIdBySocket = /* @__PURE__ */ new Map();
@@ -433,10 +574,12 @@ var SecureServer = class {
   clientIpByClientId = /* @__PURE__ */ new Map();
   rateLimitBucketsByClientId = /* @__PURE__ */ new Map();
   rateLimitBucketsByIp = /* @__PURE__ */ new Map();
+  sessionTicketStore = /* @__PURE__ */ new Map();
   constructor(options) {
-    const { heartbeat, rateLimit, adapter, ...socketServerOptions } = options;
+    const { heartbeat, rateLimit, sessionResumption, adapter, ...socketServerOptions } = options;
     this.heartbeatConfig = this.resolveHeartbeatConfig(heartbeat);
     this.rateLimitConfig = this.resolveRateLimitConfig(rateLimit);
+    this.sessionResumptionConfig = this.resolveSessionResumptionConfig(sessionResumption);
     this.socketServer = new WebSocketServer(socketServerOptions);
     this.bindSocketServerEvents();
     this.startHeartbeatLoop();
@@ -522,8 +665,8 @@ var SecureServer = class {
         this.errorHandlers.add(handler);
         return this;
       }
-      if (event === INTERNAL_HANDSHAKE_EVENT) {
-        throw new Error(`The event "${INTERNAL_HANDSHAKE_EVENT}" is reserved for internal use.`);
+      if (event === INTERNAL_HANDSHAKE_EVENT || event === INTERNAL_SESSION_TICKET_EVENT) {
+        throw new Error(`The event "${event}" is reserved for internal use.`);
       }
       const typedHandler = handler;
       const listeners = this.customEventHandlers.get(event) ?? /* @__PURE__ */ new Set();
@@ -554,7 +697,7 @@ var SecureServer = class {
         this.errorHandlers.delete(handler);
         return this;
       }
-      if (event === INTERNAL_HANDSHAKE_EVENT) {
+      if (event === INTERNAL_HANDSHAKE_EVENT || event === INTERNAL_SESSION_TICKET_EVENT) {
         return this;
       }
       const listeners = this.customEventHandlers.get(event);
@@ -687,6 +830,7 @@ var SecureServer = class {
       this.rateLimitBucketsByClientId.clear();
       this.rateLimitBucketsByIp.clear();
       this.clientIpByClientId.clear();
+      this.sessionTicketStore.clear();
       this.socketServer.close();
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to close server."));
@@ -762,6 +906,94 @@ var SecureServer = class {
       disconnectCode,
       disconnectReason
     };
+  }
+  resolveSessionResumptionConfig(sessionResumptionOptions) {
+    const ticketTtlMs = sessionResumptionOptions?.ticketTtlMs ?? DEFAULT_SESSION_TICKET_TTL_MS;
+    const maxCachedTickets = sessionResumptionOptions?.maxCachedTickets ?? DEFAULT_SESSION_TICKET_MAX_CACHE_SIZE;
+    if (!Number.isFinite(ticketTtlMs) || ticketTtlMs <= 0) {
+      throw new Error(
+        "Server sessionResumption ticketTtlMs must be a positive number."
+      );
+    }
+    if (!Number.isInteger(maxCachedTickets) || maxCachedTickets <= 0) {
+      throw new Error(
+        "Server sessionResumption maxCachedTickets must be a positive integer."
+      );
+    }
+    return {
+      enabled: sessionResumptionOptions?.enabled ?? DEFAULT_SESSION_RESUMPTION_ENABLED,
+      ticketTtlMs,
+      maxCachedTickets
+    };
+  }
+  pruneExpiredSessionTickets(now) {
+    for (const [sessionId, ticketRecord] of this.sessionTicketStore.entries()) {
+      if (ticketRecord.expiresAt <= now) {
+        this.sessionTicketStore.delete(sessionId);
+      }
+    }
+  }
+  evictSessionTicketsIfNeeded() {
+    while (this.sessionTicketStore.size > this.sessionResumptionConfig.maxCachedTickets) {
+      let oldestSessionId = null;
+      let oldestIssuedAt = Number.POSITIVE_INFINITY;
+      for (const [sessionId, ticketRecord] of this.sessionTicketStore.entries()) {
+        if (ticketRecord.issuedAt < oldestIssuedAt) {
+          oldestIssuedAt = ticketRecord.issuedAt;
+          oldestSessionId = sessionId;
+        }
+      }
+      if (!oldestSessionId) {
+        break;
+      }
+      this.sessionTicketStore.delete(oldestSessionId);
+    }
+  }
+  getSessionTicket(sessionId) {
+    const now = Date.now();
+    this.pruneExpiredSessionTickets(now);
+    const ticketRecord = this.sessionTicketStore.get(sessionId);
+    if (!ticketRecord) {
+      return null;
+    }
+    if (ticketRecord.expiresAt <= now) {
+      this.sessionTicketStore.delete(sessionId);
+      return null;
+    }
+    return ticketRecord;
+  }
+  issueSessionTicket(socket, baseKey) {
+    if (!this.sessionResumptionConfig.enabled) {
+      return;
+    }
+    const now = Date.now();
+    this.pruneExpiredSessionTickets(now);
+    const sessionId = randomUUID();
+    const sessionSecret = deriveSessionTicketSecret(baseKey);
+    const expiresAt = now + this.sessionResumptionConfig.ticketTtlMs;
+    const ticketRecord = {
+      sessionId,
+      secret: sessionSecret,
+      issuedAt: now,
+      expiresAt
+    };
+    this.sessionTicketStore.set(sessionId, ticketRecord);
+    this.evictSessionTicketsIfNeeded();
+    const ticketPayload = {
+      version: SESSION_TICKET_VERSION,
+      sessionId,
+      secret: sessionSecret.toString("base64"),
+      issuedAt: now,
+      expiresAt
+    };
+    void this.sendOrQueuePayload(socket, {
+      event: INTERNAL_SESSION_TICKET_EVENT,
+      data: ticketPayload
+    }).catch((error) => {
+      this.notifyError(
+        normalizeToError(error, "Failed to deliver secure session ticket.")
+      );
+    });
   }
   createRateLimitBucket(now) {
     return {
@@ -1133,6 +1365,14 @@ var SecureServer = class {
         await this.handleRpcRequest(client, decryptedEnvelope.data);
         return;
       }
+      if (decryptedEnvelope.event === INTERNAL_SESSION_TICKET_EVENT) {
+        this.notifyError(
+          new Error(
+            `Client ${client.id} attempted to send reserved internal session ticket event.`
+          )
+        );
+        return;
+      }
       const interceptedData = await this.applyMessageMiddleware(
         "incoming",
         client,
@@ -1446,9 +1686,103 @@ var SecureServer = class {
     this.sendRaw(
       socket,
       serializePlainEnvelope(INTERNAL_HANDSHAKE_EVENT, {
+        type: "hello",
+        protocolVersion: HANDSHAKE_PROTOCOL_VERSION,
         publicKey: localPublicKey
       })
     );
+  }
+  sendResumeAck(socket, payload) {
+    const responsePayload = {
+      type: "resume-ack",
+      protocolVersion: HANDSHAKE_PROTOCOL_VERSION,
+      ok: payload.ok
+    };
+    if (payload.sessionId !== void 0 && payload.sessionId.length > 0) {
+      responsePayload.sessionId = payload.sessionId;
+    }
+    if (payload.serverProof !== void 0 && payload.serverProof.length > 0) {
+      responsePayload.serverProof = payload.serverProof;
+    }
+    if (payload.reason !== void 0 && payload.reason.length > 0) {
+      responsePayload.reason = payload.reason;
+    }
+    this.sendRaw(
+      socket,
+      serializePlainEnvelope(INTERNAL_HANDSHAKE_EVENT, responsePayload)
+    );
+  }
+  handleResumeHandshake(client, payload) {
+    if (!this.sessionResumptionConfig.enabled) {
+      this.sendResumeAck(client.socket, {
+        ok: false,
+        reason: "Session resumption is disabled."
+      });
+      return;
+    }
+    const ticketRecord = this.getSessionTicket(payload.sessionId);
+    if (!ticketRecord) {
+      this.sendResumeAck(client.socket, {
+        ok: false,
+        reason: "Session ticket is unknown or expired."
+      });
+      return;
+    }
+    try {
+      const clientNonce = decodeBase64ToBuffer(
+        payload.clientNonce,
+        "Handshake resume clientNonce"
+      );
+      if (clientNonce.length !== RESUMPTION_NONCE_LENGTH) {
+        throw new Error(
+          `Handshake resume clientNonce must be ${RESUMPTION_NONCE_LENGTH} bytes.`
+        );
+      }
+      const receivedProof = decodeBase64ToBuffer(
+        payload.clientProof,
+        "Handshake resume clientProof"
+      );
+      const expectedProof = createResumeClientProof(
+        ticketRecord.secret,
+        ticketRecord.sessionId,
+        clientNonce
+      );
+      if (!equalsConstantTime(receivedProof, expectedProof)) {
+        this.sendResumeAck(client.socket, {
+          ok: false,
+          reason: "Session resumption proof validation failed."
+        });
+        return;
+      }
+      this.sessionTicketStore.delete(ticketRecord.sessionId);
+      const resumedKey = deriveResumedEncryptionKey(ticketRecord.secret, clientNonce);
+      const serverProof = createResumeServerProof(
+        resumedKey,
+        ticketRecord.sessionId,
+        clientNonce
+      ).toString("base64");
+      const handshakeState = this.handshakeStateBySocket.get(client.socket);
+      if (!handshakeState) {
+        throw new Error(`Missing handshake state for client ${client.id}.`);
+      }
+      this.sharedSecretBySocket.set(client.socket, resumedKey);
+      this.encryptionKeyBySocket.set(client.socket, resumedKey);
+      handshakeState.isReady = true;
+      this.sendResumeAck(client.socket, {
+        ok: true,
+        sessionId: ticketRecord.sessionId,
+        serverProof
+      });
+      void this.flushQueuedPayloads(client.socket);
+      this.notifyReady(client);
+      this.issueSessionTicket(client.socket, resumedKey);
+    } catch (error) {
+      this.sendResumeAck(client.socket, {
+        ok: false,
+        reason: "Session resumption payload was invalid."
+      });
+      this.notifyError(normalizeToError(error, "Failed to resume secure server session."));
+    }
   }
   handleInternalHandshake(client, data) {
     try {
@@ -1460,14 +1794,22 @@ var SecureServer = class {
       if (handshakeState.isReady) {
         return;
       }
+      if (payload.type === "resume") {
+        this.handleResumeHandshake(client, payload);
+        return;
+      }
+      if (payload.type === "resume-ack") {
+        throw new Error("SecureServer received unexpected resume-ack handshake payload.");
+      }
       const remotePublicKey = Buffer.from(payload.publicKey, "base64");
       const sharedSecret = handshakeState.ecdh.computeSecret(remotePublicKey);
       const encryptionKey = deriveEncryptionKey(sharedSecret);
       this.sharedSecretBySocket.set(client.socket, sharedSecret);
       this.encryptionKeyBySocket.set(client.socket, encryptionKey);
       handshakeState.isReady = true;
-      this.flushQueuedPayloads(client.socket);
+      void this.flushQueuedPayloads(client.socket);
       this.notifyReady(client);
+      this.issueSessionTicket(client.socket, encryptionKey);
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to complete server handshake."));
     }
@@ -1681,6 +2023,9 @@ var SecureClient = class {
     this.url = url;
     this.options = options;
     this.reconnectConfig = this.resolveReconnectConfig(this.options.reconnect);
+    this.sessionResumptionConfig = this.resolveSessionResumptionConfig(
+      this.options.sessionResumption
+    );
     if (this.options.autoConnect ?? true) {
       this.connect();
     }
@@ -1689,6 +2034,7 @@ var SecureClient = class {
   options;
   socket = null;
   reconnectConfig;
+  sessionResumptionConfig;
   reconnectAttemptCount = 0;
   reconnectTimer = null;
   isManualDisconnectRequested = false;
@@ -1700,6 +2046,7 @@ var SecureClient = class {
   handshakeState = null;
   pendingPayloadQueue = [];
   pendingRpcRequests = /* @__PURE__ */ new Map();
+  sessionTicket = null;
   get readyState() {
     return this.socket?.readyState ?? null;
   }
@@ -1758,8 +2105,8 @@ var SecureClient = class {
         this.errorHandlers.add(handler);
         return this;
       }
-      if (event === INTERNAL_HANDSHAKE_EVENT) {
-        throw new Error(`The event "${INTERNAL_HANDSHAKE_EVENT}" is reserved for internal use.`);
+      if (event === INTERNAL_HANDSHAKE_EVENT || event === INTERNAL_SESSION_TICKET_EVENT) {
+        throw new Error(`The event "${event}" is reserved for internal use.`);
       }
       const typedHandler = handler;
       const listeners = this.customEventHandlers.get(event) ?? /* @__PURE__ */ new Set();
@@ -1790,7 +2137,7 @@ var SecureClient = class {
         this.errorHandlers.delete(handler);
         return this;
       }
-      if (event === INTERNAL_HANDSHAKE_EVENT) {
+      if (event === INTERNAL_HANDSHAKE_EVENT || event === INTERNAL_SESSION_TICKET_EVENT) {
         return this;
       }
       const listeners = this.customEventHandlers.get(event);
@@ -1896,6 +2243,24 @@ var SecureClient = class {
       maxAttempts
     };
   }
+  resolveSessionResumptionConfig(sessionResumptionOptions) {
+    if (typeof sessionResumptionOptions === "boolean") {
+      return {
+        enabled: sessionResumptionOptions,
+        maxAcceptedTicketTtlMs: DEFAULT_SESSION_TICKET_TTL_MS
+      };
+    }
+    const maxAcceptedTicketTtlMs = sessionResumptionOptions?.maxAcceptedTicketTtlMs ?? DEFAULT_SESSION_TICKET_TTL_MS;
+    if (!Number.isFinite(maxAcceptedTicketTtlMs) || maxAcceptedTicketTtlMs <= 0) {
+      throw new Error(
+        "Client sessionResumption maxAcceptedTicketTtlMs must be a positive number."
+      );
+    }
+    return {
+      enabled: sessionResumptionOptions?.enabled ?? DEFAULT_SESSION_RESUMPTION_ENABLED,
+      maxAcceptedTicketTtlMs
+    };
+  }
   scheduleReconnect() {
     if (!this.reconnectConfig.enabled || this.reconnectTimer) {
       return;
@@ -1943,7 +2308,6 @@ var SecureClient = class {
     socket.on("open", () => {
       this.clearReconnectTimer();
       this.reconnectAttemptCount = 0;
-      this.sendInternalHandshake();
       this.notifyConnect();
     });
     socket.on("message", (rawData) => {
@@ -1997,6 +2361,10 @@ var SecureClient = class {
       }
       if (decryptedEnvelope.event === INTERNAL_RPC_REQUEST_EVENT) {
         void this.handleRpcRequest(decryptedEnvelope.data);
+        return;
+      }
+      if (decryptedEnvelope.event === INTERNAL_SESSION_TICKET_EVENT) {
+        this.handleSessionTicket(decryptedEnvelope.data);
         return;
       }
       this.dispatchCustomEvent(decryptedEnvelope.event, decryptedEnvelope.data);
@@ -2212,11 +2580,45 @@ var SecureClient = class {
     }
     this.pendingRpcRequests.clear();
   }
+  handleSessionTicket(data) {
+    if (!this.sessionResumptionConfig.enabled) {
+      return;
+    }
+    try {
+      const ticketPayload = parseSessionTicketPayload(data);
+      const now = Date.now();
+      if (ticketPayload.expiresAt <= now) {
+        return;
+      }
+      const ticketTtlMs = ticketPayload.expiresAt - ticketPayload.issuedAt;
+      if (ticketTtlMs > this.sessionResumptionConfig.maxAcceptedTicketTtlMs) {
+        throw new Error("Session ticket TTL exceeds client trust policy.");
+      }
+      const sessionSecret = decodeBase64ToBuffer(
+        ticketPayload.secret,
+        "Session ticket secret"
+      );
+      if (sessionSecret.length !== ENCRYPTION_KEY_LENGTH) {
+        throw new Error("Session ticket secret has invalid length.");
+      }
+      this.sessionTicket = {
+        sessionId: ticketPayload.sessionId,
+        secret: sessionSecret,
+        issuedAt: ticketPayload.issuedAt,
+        expiresAt: ticketPayload.expiresAt
+      };
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to process session ticket payload."));
+    }
+  }
   createClientHandshakeState() {
     const { ecdh, localPublicKey } = createEphemeralHandshakeState();
     return {
       ecdh,
       localPublicKey,
+      clientHelloSent: false,
+      pendingServerPublicKey: null,
+      resumeAttempt: null,
       isReady: false,
       sharedSecret: null,
       encryptionKey: null
@@ -2230,13 +2632,169 @@ var SecureClient = class {
       if (!this.handshakeState) {
         throw new Error("Missing client handshake state.");
       }
+      if (this.handshakeState.clientHelloSent) {
+        return;
+      }
       this.socket.send(
         serializePlainEnvelope(INTERNAL_HANDSHAKE_EVENT, {
+          type: "hello",
+          protocolVersion: HANDSHAKE_PROTOCOL_VERSION,
           publicKey: this.handshakeState.localPublicKey
         })
       );
+      this.handshakeState.clientHelloSent = true;
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to send client handshake payload."));
+    }
+  }
+  shouldAttemptSessionResumption() {
+    if (!this.sessionResumptionConfig.enabled) {
+      return false;
+    }
+    const sessionTicket = this.sessionTicket;
+    if (!sessionTicket) {
+      return false;
+    }
+    const now = Date.now();
+    if (sessionTicket.expiresAt <= now) {
+      this.sessionTicket = null;
+      return false;
+    }
+    const ticketTtlMs = sessionTicket.expiresAt - sessionTicket.issuedAt;
+    if (ticketTtlMs > this.sessionResumptionConfig.maxAcceptedTicketTtlMs) {
+      this.sessionTicket = null;
+      return false;
+    }
+    return true;
+  }
+  sendResumeHandshake() {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    if (!this.handshakeState || !this.sessionTicket) {
+      return false;
+    }
+    if (this.handshakeState.clientHelloSent) {
+      return false;
+    }
+    if (this.handshakeState.resumeAttempt?.status === "pending") {
+      return true;
+    }
+    try {
+      const clientNonce = randomBytes(RESUMPTION_NONCE_LENGTH);
+      const resumedKey = deriveResumedEncryptionKey(this.sessionTicket.secret, clientNonce);
+      const clientProof = createResumeClientProof(
+        this.sessionTicket.secret,
+        this.sessionTicket.sessionId,
+        clientNonce
+      );
+      this.socket.send(
+        serializePlainEnvelope(INTERNAL_HANDSHAKE_EVENT, {
+          type: "resume",
+          protocolVersion: HANDSHAKE_PROTOCOL_VERSION,
+          sessionId: this.sessionTicket.sessionId,
+          clientNonce: clientNonce.toString("base64"),
+          clientProof: clientProof.toString("base64")
+        })
+      );
+      this.handshakeState.resumeAttempt = {
+        status: "pending",
+        sessionId: this.sessionTicket.sessionId,
+        clientNonce,
+        resumedKey
+      };
+      return true;
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to dispatch resume handshake payload."));
+      this.sessionTicket = null;
+      this.handshakeState.resumeAttempt = null;
+      return false;
+    }
+  }
+  completeFullHandshake(serverPublicKey) {
+    if (!this.handshakeState) {
+      throw new Error("Missing client handshake state.");
+    }
+    if (this.handshakeState.isReady) {
+      return;
+    }
+    this.sendInternalHandshake();
+    const remotePublicKey = Buffer.from(serverPublicKey, "base64");
+    const sharedSecret = this.handshakeState.ecdh.computeSecret(remotePublicKey);
+    this.handshakeState.sharedSecret = sharedSecret;
+    this.handshakeState.encryptionKey = deriveEncryptionKey(sharedSecret);
+    this.handshakeState.resumeAttempt = null;
+    this.handshakeState.pendingServerPublicKey = null;
+    this.handshakeState.isReady = true;
+    void this.flushPendingPayloadQueue();
+    this.notifyReady();
+  }
+  fallbackToFullHandshake() {
+    if (!this.handshakeState || this.handshakeState.isReady) {
+      return;
+    }
+    if (this.handshakeState.resumeAttempt) {
+      this.handshakeState.resumeAttempt.status = "failed";
+    }
+    const pendingServerPublicKey = this.handshakeState.pendingServerPublicKey;
+    if (pendingServerPublicKey) {
+      this.completeFullHandshake(pendingServerPublicKey);
+      return;
+    }
+    this.sendInternalHandshake();
+  }
+  handleServerHelloHandshake(payload) {
+    if (!this.handshakeState || this.handshakeState.isReady) {
+      return;
+    }
+    this.handshakeState.pendingServerPublicKey = payload.publicKey;
+    if (this.shouldAttemptSessionResumption() && this.sendResumeHandshake()) {
+      return;
+    }
+    this.completeFullHandshake(payload.publicKey);
+  }
+  handleResumeAckHandshake(payload) {
+    if (!this.handshakeState || this.handshakeState.isReady) {
+      return;
+    }
+    const resumeAttempt = this.handshakeState.resumeAttempt;
+    if (!resumeAttempt || resumeAttempt.status !== "pending") {
+      return;
+    }
+    if (!payload.ok) {
+      this.sessionTicket = null;
+      this.fallbackToFullHandshake();
+      return;
+    }
+    if (payload.sessionId !== resumeAttempt.sessionId || !payload.serverProof) {
+      this.sessionTicket = null;
+      this.fallbackToFullHandshake();
+      return;
+    }
+    try {
+      const receivedServerProof = decodeBase64ToBuffer(
+        payload.serverProof,
+        "Handshake resume-ack serverProof"
+      );
+      const expectedServerProof = createResumeServerProof(
+        resumeAttempt.resumedKey,
+        resumeAttempt.sessionId,
+        resumeAttempt.clientNonce
+      );
+      if (!equalsConstantTime(receivedServerProof, expectedServerProof)) {
+        throw new Error("Resume server proof validation failed.");
+      }
+      this.handshakeState.sharedSecret = resumeAttempt.resumedKey;
+      this.handshakeState.encryptionKey = resumeAttempt.resumedKey;
+      this.handshakeState.pendingServerPublicKey = null;
+      resumeAttempt.status = "accepted";
+      this.handshakeState.isReady = true;
+      void this.flushPendingPayloadQueue();
+      this.notifyReady();
+    } catch (error) {
+      this.notifyError(normalizeToError(error, "Failed to verify resume server proof."));
+      this.sessionTicket = null;
+      this.fallbackToFullHandshake();
     }
   }
   handleInternalHandshake(data) {
@@ -2248,13 +2806,15 @@ var SecureClient = class {
       if (this.handshakeState.isReady) {
         return;
       }
-      const remotePublicKey = Buffer.from(payload.publicKey, "base64");
-      const sharedSecret = this.handshakeState.ecdh.computeSecret(remotePublicKey);
-      this.handshakeState.sharedSecret = sharedSecret;
-      this.handshakeState.encryptionKey = deriveEncryptionKey(sharedSecret);
-      this.handshakeState.isReady = true;
-      void this.flushPendingPayloadQueue();
-      this.notifyReady();
+      if (payload.type === "hello") {
+        this.handleServerHelloHandshake(payload);
+        return;
+      }
+      if (payload.type === "resume-ack") {
+        this.handleResumeAckHandshake(payload);
+        return;
+      }
+      throw new Error("SecureClient received unexpected resume request handshake payload.");
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to complete client handshake."));
     }

@@ -29,6 +29,11 @@ interface SecureServerRateLimitOptions {
     disconnectCode?: number;
     disconnectReason?: string;
 }
+interface SecureServerSessionResumptionOptions {
+    enabled?: boolean;
+    ticketTtlMs?: number;
+    maxCachedTickets?: number;
+}
 type SecureServerAdapterMessageScope = "broadcast" | "room";
 interface SecureServerAdapterMessage {
     version: typeof SECURE_SERVER_ADAPTER_MESSAGE_VERSION;
@@ -47,6 +52,7 @@ interface SecureServerAdapter {
 interface SecureServerOptions extends ServerOptions {
     heartbeat?: SecureServerHeartbeatOptions;
     rateLimit?: SecureServerRateLimitOptions;
+    sessionResumption?: SecureServerSessionResumptionOptions;
     adapter?: SecureServerAdapter;
 }
 interface SecureClientReconnectOptions {
@@ -57,11 +63,16 @@ interface SecureClientReconnectOptions {
     jitterRatio?: number;
     maxAttempts?: number | null;
 }
+interface SecureClientSessionResumptionOptions {
+    enabled?: boolean;
+    maxAcceptedTicketTtlMs?: number;
+}
 interface SecureClientOptions {
     protocols?: string | string[];
     wsOptions?: ClientOptions;
     autoConnect?: boolean;
     reconnect?: boolean | SecureClientReconnectOptions;
+    sessionResumption?: boolean | SecureClientSessionResumptionOptions;
 }
 interface SecureServerClient {
     id: string;
@@ -122,6 +133,7 @@ declare class SecureServer {
     private adapter;
     private readonly heartbeatConfig;
     private readonly rateLimitConfig;
+    private readonly sessionResumptionConfig;
     private heartbeatIntervalHandle;
     private readonly clientsById;
     private readonly clientIdBySocket;
@@ -143,6 +155,7 @@ declare class SecureServer {
     private readonly clientIpByClientId;
     private readonly rateLimitBucketsByClientId;
     private readonly rateLimitBucketsByIp;
+    private readonly sessionTicketStore;
     constructor(options: SecureServerOptions);
     get clientCount(): number;
     get serverId(): string;
@@ -169,6 +182,11 @@ declare class SecureServer {
     close(code?: number, reason?: string): void;
     private resolveHeartbeatConfig;
     private resolveRateLimitConfig;
+    private resolveSessionResumptionConfig;
+    private pruneExpiredSessionTickets;
+    private evictSessionTicketsIfNeeded;
+    private getSessionTicket;
+    private issueSessionTicket;
     private createRateLimitBucket;
     private getOrCreateRateLimitBucket;
     private updateRateLimitBucket;
@@ -202,6 +220,8 @@ declare class SecureServer {
     private notifyError;
     private createServerHandshakeState;
     private sendInternalHandshake;
+    private sendResumeAck;
+    private handleResumeHandshake;
     private handleInternalHandshake;
     private isClientHandshakeReady;
     private sendOrQueuePayload;
@@ -221,6 +241,7 @@ declare class SecureClient {
     private readonly options;
     private socket;
     private readonly reconnectConfig;
+    private readonly sessionResumptionConfig;
     private reconnectAttemptCount;
     private reconnectTimer;
     private isManualDisconnectRequested;
@@ -232,6 +253,7 @@ declare class SecureClient {
     private handshakeState;
     private pendingPayloadQueue;
     private readonly pendingRpcRequests;
+    private sessionTicket;
     constructor(url: string, options?: SecureClientOptions);
     get readyState(): number | null;
     isConnected(): boolean;
@@ -252,6 +274,7 @@ declare class SecureClient {
     emit(event: string, data: unknown, options: SecureAckOptions): Promise<unknown>;
     emit(event: string, data: unknown, options: SecureAckOptions, callback: SecureAckCallback): boolean;
     private resolveReconnectConfig;
+    private resolveSessionResumptionConfig;
     private scheduleReconnect;
     private computeReconnectDelay;
     private clearReconnectTimer;
@@ -269,11 +292,18 @@ declare class SecureClient {
     private handleRpcRequest;
     private executeRpcRequestHandler;
     private rejectPendingRpcRequests;
+    private handleSessionTicket;
     private createClientHandshakeState;
     private sendInternalHandshake;
+    private shouldAttemptSessionResumption;
+    private sendResumeHandshake;
+    private completeFullHandshake;
+    private fallbackToFullHandshake;
+    private handleServerHelloHandshake;
+    private handleResumeAckHandshake;
     private handleInternalHandshake;
     private isHandshakeReady;
     private flushPendingPayloadQueue;
 }
 
-export { type SecureAckCallback, type SecureAckOptions, type SecureBinaryPayload, SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureClientReconnectOptions, type SecureEnvelope, type SecureErrorHandler, SecureServer, type SecureServerAdapter, type SecureServerAdapterMessage, type SecureServerAdapterMessageScope, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerConnectionMiddlewareContext, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerHeartbeatOptions, type SecureServerLifecycleEvent, type SecureServerMessageMiddlewareContext, type SecureServerMiddleware, type SecureServerMiddlewareContext, type SecureServerMiddlewareNext, type SecureServerOptions, type SecureServerRateLimitAction, type SecureServerRateLimitOptions, type SecureServerReadyHandler, type SecureServerRoomOperator, normalizeSecureServerAdapterMessage };
+export { type SecureAckCallback, type SecureAckOptions, type SecureBinaryPayload, SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureClientReconnectOptions, type SecureClientSessionResumptionOptions, type SecureEnvelope, type SecureErrorHandler, SecureServer, type SecureServerAdapter, type SecureServerAdapterMessage, type SecureServerAdapterMessageScope, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerConnectionMiddlewareContext, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerHeartbeatOptions, type SecureServerLifecycleEvent, type SecureServerMessageMiddlewareContext, type SecureServerMiddleware, type SecureServerMiddlewareContext, type SecureServerMiddlewareNext, type SecureServerOptions, type SecureServerRateLimitAction, type SecureServerRateLimitOptions, type SecureServerReadyHandler, type SecureServerRoomOperator, type SecureServerSessionResumptionOptions, normalizeSecureServerAdapterMessage };

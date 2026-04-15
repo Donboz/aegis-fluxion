@@ -1,6 +1,6 @@
 {
   "name": "aegis-fluxion",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "description": "Umbrella package for the aegis-fluxion E2E encrypted WebSocket toolkit.",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -29,7 +29,7 @@
     "prepublishOnly": "npm run clean && npm run build && npm run typecheck"
   },
   "dependencies": {
-    "@aegis-fluxion/core": "^0.7.2",
+    "@aegis-fluxion/core": "^0.8.0",
     "@aegis-fluxion/mcp-adapter": "^0.7.0",
     "@aegis-fluxion/redis-adapter": "^0.1.0"
   },
