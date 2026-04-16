@@ -38,6 +38,11 @@
   "engines": {
     "node": ">=18.18.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Donboz/aegis-fluxion.git",
+    "directory": "packages/browser-client"
+  },
   "keywords": [
     "browser",
     "websocket",

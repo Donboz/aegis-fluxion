@@ -1,0 +1,149 @@
+name: Publish Packages
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test-build-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run tests
+        run: npm run test
+
+      - name: Build packages
+        run: npm run build
+
+      - name: Publish only version-bumped packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_BEFORE: ${{ github.event.before }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          node <<'NODE'
+          const { execSync } = require('node:child_process');
+          const { readFileSync } = require('node:fs');
+
+          const before = process.env.GITHUB_BEFORE;
+          const after = process.env.GITHUB_SHA;
+
+          if (!before || /^0+$/.test(before)) {
+            console.log('No valid previous commit SHA detected. Skipping publish step.');
+            process.exit(0);
+          }
+
+          function run(command) {
+            return execSync(command, {
+              encoding: 'utf8',
+              stdio: ['pipe', 'pipe', 'pipe']
+            }).trim();
+          }
+
+          function parseSemver(version) {
+            const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version);
+            if (!match) return null;
+            return match.slice(1, 4).map(Number);
+          }
+
+          function isVersionBumped(next, prev) {
+            const nextParts = parseSemver(next);
+            const prevParts = parseSemver(prev);
+
+            if (!nextParts || !prevParts) {
+              return next !== prev;
+            }
+
+            for (let i = 0; i < 3; i += 1) {
+              if (nextParts[i] > prevParts[i]) return true;
+              if (nextParts[i] < prevParts[i]) return false;
+            }
+
+            return false;
+          }
+
+          const changedFilesRaw = run(
+            `git diff --name-only ${before} ${after} -- packages/*/package.json`
+          );
+
+          const changedFiles = changedFilesRaw
+            .split('\n')
+            .map((line) => line.trim())
+            .filter(Boolean);
+
+          if (changedFiles.length === 0) {
+            console.log('No package.json changes detected under packages/. Nothing to publish.');
+            process.exit(0);
+          }
+
+          const bumpedPackages = [];
+
+          for (const file of changedFiles) {
+            const current = JSON.parse(readFileSync(file, 'utf8'));
+            let previousVersion = null;
+
+            try {
+              const previousRaw = run(`git show ${before}:${file}`);
+              previousVersion = JSON.parse(previousRaw).version ?? null;
+            } catch {
+              previousVersion = null;
+            }
+
+            if (!previousVersion || isVersionBumped(current.version, previousVersion)) {
+              bumpedPackages.push({
+                name: current.name,
+                version: current.version,
+                previousVersion
+              });
+            }
+          }
+
+          if (bumpedPackages.length === 0) {
+            console.log('No version-bumped packages found. Nothing to publish.');
+            process.exit(0);
+          }
+
+          console.log('Version-bumped packages detected:');
+          for (const pkg of bumpedPackages) {
+            console.log(`- ${pkg.name}: ${pkg.previousVersion ?? 'new'} -> ${pkg.version}`);
+          }
+
+          for (const pkg of bumpedPackages) {
+            let registryVersion = null;
+
+            try {
+              registryVersion = run(`npm view ${pkg.name} version`);
+            } catch {
+              registryVersion = null;
+            }
+
+            if (registryVersion === pkg.version) {
+              console.log(`Skipping ${pkg.name}@${pkg.version}: already published.`);
+              continue;
+            }
+
+            console.log(`Publishing ${pkg.name}@${pkg.version}...`);
+            execSync(`npm publish --workspace "${pkg.name}" --access public`, {
+              stdio: 'inherit'
+            });
+          }
+          NODE
