@@ -47,6 +47,10 @@
     "url": "git+https://github.com/Donboz/aegis-fluxion.git",
     "directory": "packages/redis-adapter"
   },
+  "homepage": "https://github.com/Donboz/aegis-fluxion#readme",
+  "bugs": {
+    "url": "https://github.com/Donboz/aegis-fluxion/issues"
+  },
   "keywords": [
     "redis",
     "pubsub",

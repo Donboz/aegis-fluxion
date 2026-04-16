@@ -43,6 +43,10 @@
     "url": "git+https://github.com/Donboz/aegis-fluxion.git",
     "directory": "packages/browser-client"
   },
+  "homepage": "https://github.com/Donboz/aegis-fluxion#readme",
+  "bugs": {
+    "url": "https://github.com/Donboz/aegis-fluxion/issues"
+  },
   "keywords": [
     "browser",
     "websocket",

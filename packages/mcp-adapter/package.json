@@ -46,6 +46,10 @@
     "url": "git+https://github.com/Donboz/aegis-fluxion.git",
     "directory": "packages/mcp-adapter"
   },
+  "homepage": "https://github.com/Donboz/aegis-fluxion#readme",
+  "bugs": {
+    "url": "https://github.com/Donboz/aegis-fluxion/issues"
+  },
   "keywords": [
     "mcp",
     "model-context-protocol",

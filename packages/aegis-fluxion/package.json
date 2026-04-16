@@ -46,6 +46,10 @@
     "url": "git+https://github.com/Donboz/aegis-fluxion.git",
     "directory": "packages/aegis-fluxion"
   },
+  "homepage": "https://github.com/Donboz/aegis-fluxion#readme",
+  "bugs": {
+    "url": "https://github.com/Donboz/aegis-fluxion/issues"
+  },
   "keywords": [
     "websocket",
     "e2e-encryption",

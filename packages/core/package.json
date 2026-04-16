@@ -46,5 +46,9 @@
     "type": "git",
     "url": "git+https://github.com/Donboz/aegis-fluxion.git",
     "directory": "packages/core"
+  },
+  "homepage": "https://github.com/Donboz/aegis-fluxion#readme",
+  "bugs": {
+    "url": "https://github.com/Donboz/aegis-fluxion/issues"
   }
 }
