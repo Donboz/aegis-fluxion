@@ -1,7 +1,7 @@
 {
-  "name": "aegis-fluxion",
-  "version": "0.7.5",
-  "description": "Umbrella package for the aegis-fluxion E2E encrypted WebSocket toolkit.",
+  "name": "@aegis-fluxion/browser-client",
+  "version": "0.1.0",
+  "description": "Browser-native SecureClient for aegis-fluxion using Web Crypto and WebSocket APIs.",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -25,29 +25,27 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest --passWithNoTests",
     "clean": "node -e \"import('node:fs').then(({ rmSync }) => rmSync('dist', { recursive: true, force: true }))\"",
-    "prepublishOnly": "npm run clean && npm run build && npm run typecheck"
-  },
-  "dependencies": {
-    "@aegis-fluxion/core": "^0.9.0",
-    "@aegis-fluxion/browser-client": "^0.1.0",
-    "@aegis-fluxion/mcp-adapter": "^0.7.0",
-    "@aegis-fluxion/redis-adapter": "^0.1.0"
+    "prepublishOnly": "npm run clean && npm run build && npm run typecheck && npm run test"
   },
   "devDependencies": {
     "tsup": "^8.3.5",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
   },
   "engines": {
     "node": ">=18.18.0"
   },
   "keywords": [
+    "browser",
     "websocket",
+    "webcrypto",
     "e2e-encryption",
     "aes-gcm",
     "ecdh",
-    "secure-messaging",
-    "ack"
+    "react"
   ],
   "license": "MIT"
 }

@@ -1,23 +1,24 @@
 {
   "name": "aegis-fluxion-monorepo",
-  "version": "0.7.4",
+  "version": "0.7.5",
   "private": true,
   "description": "Monorepo for the aegis-fluxion E2E encrypted WebSocket toolkit.",
   "workspaces": [
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build -w @aegis-fluxion/core && npm run build -w @aegis-fluxion/mcp-adapter && npm run build -w @aegis-fluxion/redis-adapter && npm run build -w aegis-fluxion",
+    "build": "npm run build -w @aegis-fluxion/core && npm run build -w @aegis-fluxion/mcp-adapter && npm run build -w @aegis-fluxion/redis-adapter && npm run build -w @aegis-fluxion/browser-client && npm run build -w aegis-fluxion",
     "dev": "npm run dev -w @aegis-fluxion/core",
-    "typecheck": "npm run build -w @aegis-fluxion/core && npm run typecheck -w @aegis-fluxion/core && npm run build -w @aegis-fluxion/mcp-adapter && npm run typecheck -w @aegis-fluxion/mcp-adapter && npm run build -w @aegis-fluxion/redis-adapter && npm run typecheck -w @aegis-fluxion/redis-adapter && npm run typecheck -w aegis-fluxion",
-    "test": "npm run test -w @aegis-fluxion/core && npm run test -w @aegis-fluxion/mcp-adapter && npm run test -w @aegis-fluxion/redis-adapter && npm run test -w aegis-fluxion --if-present",
-    "clean": "npm run clean -w @aegis-fluxion/core && npm run clean -w @aegis-fluxion/mcp-adapter && npm run clean -w @aegis-fluxion/redis-adapter && npm run clean -w aegis-fluxion",
+    "typecheck": "npm run build -w @aegis-fluxion/core && npm run typecheck -w @aegis-fluxion/core && npm run build -w @aegis-fluxion/mcp-adapter && npm run typecheck -w @aegis-fluxion/mcp-adapter && npm run build -w @aegis-fluxion/redis-adapter && npm run typecheck -w @aegis-fluxion/redis-adapter && npm run build -w @aegis-fluxion/browser-client && npm run typecheck -w @aegis-fluxion/browser-client && npm run typecheck -w aegis-fluxion",
+    "test": "npm run test -w @aegis-fluxion/core && npm run test -w @aegis-fluxion/mcp-adapter && npm run test -w @aegis-fluxion/redis-adapter && npm run test -w @aegis-fluxion/browser-client && npm run test -w aegis-fluxion --if-present",
+    "clean": "npm run clean -w @aegis-fluxion/core && npm run clean -w @aegis-fluxion/mcp-adapter && npm run clean -w @aegis-fluxion/redis-adapter && npm run clean -w @aegis-fluxion/browser-client && npm run clean -w aegis-fluxion",
     "publish:core": "npm publish -w @aegis-fluxion/core --access public",
     "publish:mcp-adapter": "npm publish -w @aegis-fluxion/mcp-adapter --access public",
     "publish:redis-adapter": "npm publish -w @aegis-fluxion/redis-adapter --access public",
+    "publish:browser-client": "npm publish -w @aegis-fluxion/browser-client --access public",
     "publish:umbrella": "npm publish -w aegis-fluxion --access public",
     "release:core": "npm run test && npm run build && npm run publish:core",
-    "release:all": "npm run test && npm run build && npm run publish:core && npm run publish:mcp-adapter && npm run publish:redis-adapter && npm run publish:umbrella"
+    "release:all": "npm run test && npm run build && npm run publish:core && npm run publish:mcp-adapter && npm run publish:redis-adapter && npm run publish:browser-client && npm run publish:umbrella"
   },
   "engines": {
     "node": ">=18.18.0"

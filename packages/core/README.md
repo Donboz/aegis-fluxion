@@ -28,6 +28,79 @@ npm install @aegis-fluxion/core ws
 
 ---
 
+## Frontend integration (React)
+
+`@aegis-fluxion/core` is server/runtime focused. For browser clients, pair it with
+`@aegis-fluxion/browser-client`.
+
+### Node backend (`SecureServer`)
+
+```ts
+import { SecureServer } from "@aegis-fluxion/core";
+
+const server = new SecureServer({ host: "127.0.0.1", port: 8080 });
+
+server.on("feed:publish", async (payload) => {
+  server.emit("feed:message", payload);
+  return { ok: true };
+});
+```
+
+### React frontend (`BrowserSecureClient`)
+
+```tsx
+import { useEffect, useMemo, useState } from "react";
+import { BrowserSecureClient } from "@aegis-fluxion/browser-client";
+
+export function SecureFeedPanel() {
+  const [status, setStatus] = useState("connecting");
+  const [messages, setMessages] = useState<string[]>([]);
+
+  const client = useMemo(() => {
+    return new BrowserSecureClient("ws://127.0.0.1:8080", {
+      autoConnect: false,
+      reconnect: true
+    });
+  }, []);
+
+  useEffect(() => {
+    const onReady = () => setStatus("ready");
+    const onDisconnect = () => setStatus("disconnected");
+    const onFeedMessage = (payload: unknown) => {
+      const data = payload as { text?: string };
+      if (typeof data.text === "string") {
+        setMessages((prev) => [data.text, ...prev]);
+      }
+    };
+
+    client.on("ready", onReady);
+    client.on("disconnect", onDisconnect);
+    client.on("feed:message", onFeedMessage);
+    client.connect();
+
+    return () => {
+      client.off("ready", onReady);
+      client.off("disconnect", onDisconnect);
+      client.off("feed:message", onFeedMessage);
+      client.disconnect();
+    };
+  }, [client]);
+
+  return (
+    <section>
+      <p>Status: {status}</p>
+      <ul>
+        {messages.map((message) => (
+          <li key={message}>{message}</li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+```
+
+---
+
 ## Chunked streaming (new in 0.9.0)
 
 `@aegis-fluxion/core@0.9.0` adds secure chunked stream transport for large payloads.

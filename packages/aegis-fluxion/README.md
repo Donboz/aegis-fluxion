@@ -2,7 +2,7 @@
 
 Main end-user package for the `aegis-fluxion` secure messaging ecosystem.
 
-Version: **0.7.4**
+Version: **0.7.5**
 
 ---
 
@@ -11,6 +11,7 @@ Version: **0.7.4**
 `aegis-fluxion` re-exports all public APIs from:
 
 - `@aegis-fluxion/core`
+- `@aegis-fluxion/browser-client`
 - `@aegis-fluxion/mcp-adapter`
 - `@aegis-fluxion/redis-adapter`
 
@@ -19,15 +20,11 @@ without multiple package-level imports.
 
 ---
 
-## What's new in 0.7.4
+## What's new in 0.7.5
 
-- Umbrella package now targets `@aegis-fluxion/core@^0.9.0`.
-- Chunked streaming is now available from the same top-level exports:
-  - `client.emitStream(...)`
-  - `client.onStream(...)`
-  - `server.emitStreamTo(...)`
-  - `server.onStream(...)`
-- Large payloads are split into ordered encrypted frames (`start/chunk/end/abort`) and validated on receive.
+- New frontend/browser package support through `@aegis-fluxion/browser-client@^0.1.0`.
+- Browser client APIs are now available from umbrella exports.
+- Existing secure transport features (ACK, binary payloads, chunked streaming) remain available.
 
 ---
 
@@ -59,6 +56,43 @@ client.on("ready", async () => {
   const response = await client.emit("tasks:create", { id: "t-1" }, { timeoutMs: 1200 });
   console.log(response);
 });
+```
+
+---
+
+## Frontend React quick example
+
+```tsx
+import { useEffect, useMemo, useState } from "react";
+import { BrowserSecureClient } from "aegis-fluxion";
+
+export function SecureTimeline() {
+  const [status, setStatus] = useState("connecting");
+
+  const client = useMemo(() => {
+    return new BrowserSecureClient("wss://api.example.com/socket", {
+      autoConnect: false,
+      reconnect: true
+    });
+  }, []);
+
+  useEffect(() => {
+    const handleReady = () => setStatus("ready");
+    const handleDisconnect = () => setStatus("disconnected");
+
+    client.on("ready", handleReady);
+    client.on("disconnect", handleDisconnect);
+    client.connect();
+
+    return () => {
+      client.off("ready", handleReady);
+      client.off("disconnect", handleDisconnect);
+      client.disconnect();
+    };
+  }, [client]);
+
+  return <p>Secure browser socket status: {status}</p>;
+}
 ```
 
 ---
@@ -216,6 +250,7 @@ await clientTransport.send({
 ## Related documentation
 
 - Core: [`../core/README.md`](../core/README.md)
+- Browser client: [`../browser-client/README.md`](../browser-client/README.md)
 - Redis adapter: [`../redis-adapter/README.md`](../redis-adapter/README.md)
 - MCP adapter: [`../mcp-adapter/README.md`](../mcp-adapter/README.md)
 - Changelog: [`../../CHANGELOG.md`](../../CHANGELOG.md)

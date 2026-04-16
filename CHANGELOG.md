@@ -7,6 +7,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.5] - 2026-04-16
+
+### Added
+
+- New package `@aegis-fluxion/browser-client@0.1.0` for browser/frontend usage.
+- Browser-native secure client implementation using:
+  - Web Crypto API (`ECDH P-256` + `AES-256-GCM`)
+  - native `WebSocket`
+- Browser SDK feature set includes:
+  - encrypted event emit/listen
+  - ACK request/response flow (`emit(..., { timeoutMs })`)
+  - binary payload handling (`Uint8Array`, `ArrayBuffer`, `Blob`)
+  - encrypted chunked streaming (`emitStream`, `onStream`)
+  - reconnect backoff controls
+- Umbrella package now re-exports `@aegis-fluxion/browser-client` for single-import workflows.
+
+### Changed
+
+- Umbrella package `aegis-fluxion` patch-bumped from `0.7.4` to `0.7.5`.
+- Root monorepo version synchronized to `0.7.5` to match the umbrella package.
+- Root workspace scripts (`build`, `typecheck`, `test`, `clean`, publish flows) now include `@aegis-fluxion/browser-client`.
+
+### Security
+
+- Browser payloads are protected by the same encrypted envelope model used by core transport (`AES-256-GCM` with tamper detection).
+- Browser stream frames enforce ordering and byte-length/total-size validation before delivery to stream consumers.
+
 ## [0.7.4] - 2026-04-16
 
 ### Added

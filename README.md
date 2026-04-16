@@ -1,6 +1,6 @@
 # aegis-fluxion
 
-![Version](https://img.shields.io/badge/version-0.7.4-2563eb)
+![Version](https://img.shields.io/badge/version-0.7.5-2563eb)
 ![Node](https://img.shields.io/badge/node-%3E%3D18.18.0-16a34a)
 ![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178c6)
 ![Crypto](https://img.shields.io/badge/Crypto-ECDH%20%2B%20AES--256--GCM-0f172a)
@@ -20,21 +20,18 @@ middleware-based policy controls, and horizontal scaling through Redis Pub/Sub a
 | --- | --- |
 | `aegis-fluxion` | Umbrella package (recommended app-facing import) |
 | `@aegis-fluxion/core` | Secure transport primitives (`SecureServer`, `SecureClient`) |
+| `@aegis-fluxion/browser-client` | Browser-native secure client (`Web Crypto` + native `WebSocket`) |
 | `@aegis-fluxion/mcp-adapter` | MCP JSON-RPC transport over encrypted channels |
 | `@aegis-fluxion/redis-adapter` | Horizontal scaling adapter for cluster fanout |
 
 ---
 
-## What's new in 0.7.4
+## What's new in 0.7.5
 
-- Added encrypted **chunked streaming** support for large payload transfers.
-- New stream APIs are now available from umbrella exports:
-  - `client.emitStream(...)`
-  - `client.onStream(...)`
-  - `server.emitStreamTo(...)`
-  - `server.onStream(...)`
-- Each stream is transmitted through ordered `start/chunk/end/abort` internal frames and protected by AES-256-GCM.
-- Umbrella package now targets `@aegis-fluxion/core@^0.9.0`.
+- Added `@aegis-fluxion/browser-client@0.1.0` for frontend/browser runtimes.
+- Browser SDK includes encrypted events, ACK flow, binary payload handling, and chunked streaming.
+- Umbrella package `aegis-fluxion@0.7.5` now re-exports browser client APIs.
+- Root workspace automation (`build`, `typecheck`, `test`, publish scripts) now includes browser-client.
 
 ---
 
@@ -93,6 +90,61 @@ client.on("ready", async () => {
 
   console.log(result);
 });
+```
+
+---
+
+## Browser/Frontend SDK (React)
+
+```tsx
+import { useEffect, useMemo, useState } from "react";
+import { BrowserSecureClient } from "@aegis-fluxion/browser-client";
+
+export function SecureFeed() {
+  const [status, setStatus] = useState("connecting");
+  const [events, setEvents] = useState<string[]>([]);
+
+  const client = useMemo(() => {
+    return new BrowserSecureClient("wss://api.example.com/socket", {
+      autoConnect: false,
+      reconnect: true
+    });
+  }, []);
+
+  useEffect(() => {
+    const onReady = () => setStatus("ready");
+    const onDisconnect = () => setStatus("disconnected");
+    const onFeedMessage = (payload: unknown) => {
+      const data = payload as { message?: string };
+      if (typeof data.message === "string") {
+        setEvents((prev) => [data.message, ...prev]);
+      }
+    };
+
+    client.on("ready", onReady);
+    client.on("disconnect", onDisconnect);
+    client.on("feed:message", onFeedMessage);
+    client.connect();
+
+    return () => {
+      client.off("ready", onReady);
+      client.off("disconnect", onDisconnect);
+      client.off("feed:message", onFeedMessage);
+      client.disconnect();
+    };
+  }, [client]);
+
+  return (
+    <section>
+      <p>Secure channel: {status}</p>
+      <ul>
+        {events.map((value) => (
+          <li key={value}>{value}</li>
+        ))}
+      </ul>
+    </section>
+  );
+}
 ```
 
 ---
