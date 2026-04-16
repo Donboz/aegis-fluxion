@@ -2,7 +2,7 @@
 
 Low-level encrypted WebSocket primitives for the `aegis-fluxion` ecosystem.
 
-Version: **0.9.0**
+Version: **0.10.0**
 
 ---
 
@@ -10,6 +10,7 @@ Version: **0.9.0**
 
 - Ephemeral ECDH handshake (`prime256v1`)
 - AES-256-GCM encrypted envelopes
+- Built-in telemetry via `getMetrics()` and `getMetricsPrometheus()`
 - ACK request/response (Promise + callback styles)
 - Encrypted chunked streaming for large `Buffer`/`Readable` payloads
 - Secure room routing (`join`, `leave`, `leaveAll`, `to(room).emit(...)`)
@@ -24,6 +25,49 @@ Version: **0.9.0**
 
 ```bash
 npm install @aegis-fluxion/core ws
+```
+
+---
+
+## Observability & telemetry (new in 0.10.0)
+
+`SecureServer` exposes real-time metrics for operational visibility:
+
+- active secure connections
+- successful/failed handshakes (including resume attempts)
+- encrypted message and byte throughput (ingress/egress)
+- DDoS/rate-limit counters (blocked, throttled, disconnected)
+
+### JSON metrics snapshot
+
+```ts
+import { SecureServer } from "@aegis-fluxion/core";
+
+const server = new SecureServer({ host: "127.0.0.1", port: 8080 });
+
+const snapshot = server.getMetrics();
+console.log(snapshot.activeConnections);
+console.log(snapshot.encryptedMessagesReceivedTotal);
+```
+
+### Prometheus endpoint integration
+
+```ts
+import { createServer } from "node:http";
+import { SecureServer } from "@aegis-fluxion/core";
+
+const secureServer = new SecureServer({ host: "127.0.0.1", port: 8080 });
+
+createServer((request, response) => {
+  if (request.url === "/metrics") {
+    response.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+    response.end(secureServer.getMetricsPrometheus());
+    return;
+  }
+
+  response.statusCode = 404;
+  response.end("Not Found");
+}).listen(9100, "127.0.0.1");
 ```
 
 ---

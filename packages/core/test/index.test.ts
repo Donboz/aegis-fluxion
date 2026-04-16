@@ -1756,4 +1756,139 @@ describe("SecureServer and SecureClient encryption flow", () => {
       await wait(30);
     }
   });
+
+  it("exposes telemetry snapshot and Prometheus metrics for secure traffic", async () => {
+    const port = await getFreePort();
+    const server = new SecureServer({
+      port,
+      host: "127.0.0.1",
+      rateLimit: {
+        enabled: true,
+        windowMs: 1_000,
+        maxEventsPerConnection: 1,
+        maxEventsPerIp: 2,
+        action: "throttle",
+        throttleMs: 80,
+        maxThrottleMs: 80,
+        disconnectAfterViolations: 10
+      }
+    });
+
+    const client = new SecureClient(`ws://127.0.0.1:${port}`, {
+      reconnect: false
+    });
+
+    server.on("telemetry:probe", (payload, peer) => {
+      peer.emit("telemetry:ack", payload);
+    });
+
+    try {
+      await Promise.all([
+        withTimeout(
+          new Promise<void>((resolve) => {
+            server.on("ready", () => {
+              resolve();
+            });
+          }),
+          TEST_TIMEOUT_MS,
+          "server ready for telemetry metrics test"
+        ),
+        withTimeout(
+          new Promise<void>((resolve) => {
+            client.on("ready", () => {
+              resolve();
+            });
+          }),
+          TEST_TIMEOUT_MS,
+          "client ready for telemetry metrics test"
+        )
+      ]);
+
+      const ackPromise = withTimeout(
+        new Promise<unknown>((resolve) => {
+          client.on("telemetry:ack", (payload) => {
+            resolve(payload);
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "telemetry ack"
+      );
+
+      expect(client.emit("telemetry:probe", { sequence: 1 })).toBe(true);
+      expect(client.emit("telemetry:probe", { sequence: 2 })).toBe(true);
+      expect(client.emit("telemetry:probe", { sequence: 3 })).toBe(true);
+
+      await expect(ackPromise).resolves.toEqual({ sequence: 1 });
+      await wait(240);
+
+      const metrics = server.getMetrics();
+      const prometheusMetrics = server.getMetricsPrometheus();
+
+      expect(metrics.activeConnections).toBe(1);
+      expect(metrics.totalConnections).toBeGreaterThanOrEqual(1);
+      expect(metrics.handshakeSuccessTotal).toBeGreaterThanOrEqual(1);
+      expect(metrics.handshakeFailureTotal).toBeGreaterThanOrEqual(0);
+      expect(metrics.encryptedMessagesReceivedTotal).toBeGreaterThanOrEqual(1);
+      expect(metrics.encryptedMessagesSentTotal).toBeGreaterThanOrEqual(1);
+      expect(metrics.ddosThrottledTotal).toBeGreaterThanOrEqual(1);
+      expect(metrics.ddosBlockedTotal).toBeGreaterThanOrEqual(1);
+
+      expect(prometheusMetrics).toContain(
+        "aegis_fluxion_server_active_connections"
+      );
+      expect(prometheusMetrics).toContain(
+        "aegis_fluxion_server_handshake_success_total"
+      );
+      expect(prometheusMetrics).toContain(
+        "aegis_fluxion_server_encrypted_messages_received_total"
+      );
+      expect(prometheusMetrics).toContain("aegis_fluxion_server_ddos_blocked_total");
+    } finally {
+      client.disconnect();
+      server.close();
+      await wait(30);
+    }
+  });
+
+  it("tracks failed handshake attempts in telemetry metrics", async () => {
+    const port = await getFreePort();
+    const server = new SecureServer({ port, host: "127.0.0.1" });
+    const rawClient = new WebSocket(`ws://127.0.0.1:${port}`);
+
+    try {
+      await withTimeout(
+        new Promise<void>((resolve) => {
+          rawClient.on("open", () => {
+            resolve();
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "raw client open for failed handshake telemetry"
+      );
+
+      rawClient.send(
+        JSON.stringify({
+          event: "__handshake",
+          data: {
+            type: "hello",
+            protocolVersion: 1
+          }
+        })
+      );
+
+      await wait(120);
+
+      const metrics = server.getMetrics();
+
+      expect(metrics.totalConnections).toBeGreaterThanOrEqual(1);
+      expect(metrics.handshakeFailureTotal).toBeGreaterThanOrEqual(1);
+      expect(server.getMetricsPrometheus()).toContain(
+        "aegis_fluxion_server_handshake_failure_total"
+      );
+    } finally {
+      rawClient.close();
+      server.close();
+      await wait(30);
+    }
+  });
 });

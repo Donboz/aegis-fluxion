@@ -2,7 +2,7 @@
 
 Main end-user package for the `aegis-fluxion` secure messaging ecosystem.
 
-Version: **0.7.5**
+Version: **0.7.6**
 
 ---
 
@@ -20,11 +20,14 @@ without multiple package-level imports.
 
 ---
 
-## What's new in 0.7.5
+## What's new in 0.7.6
 
-- New frontend/browser package support through `@aegis-fluxion/browser-client@^0.1.0`.
-- Browser client APIs are now available from umbrella exports.
-- Existing secure transport features (ACK, binary payloads, chunked streaming) remain available.
+- Observability & Telemetry support landed in `@aegis-fluxion/core@^0.10.0`.
+- `SecureServer` now exposes:
+  - `getMetrics()` JSON snapshots
+  - `getMetricsPrometheus()` Prometheus-friendly output
+- Telemetry includes active connection gauge, handshake counters,
+  encrypted message traffic, and blocked DDoS/rate-limit counters.
 
 ---
 
@@ -56,6 +59,34 @@ client.on("ready", async () => {
   const response = await client.emit("tasks:create", { id: "t-1" }, { timeoutMs: 1200 });
   console.log(response);
 });
+```
+
+---
+
+## Observability quick example
+
+```ts
+import { createServer } from "node:http";
+import { SecureServer } from "aegis-fluxion";
+
+const secureServer = new SecureServer({ host: "127.0.0.1", port: 8080 });
+
+createServer((request, response) => {
+  if (request.url === "/metrics") {
+    response.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+    response.end(secureServer.getMetricsPrometheus());
+    return;
+  }
+
+  if (request.url === "/metrics.json") {
+    response.setHeader("Content-Type", "application/json; charset=utf-8");
+    response.end(JSON.stringify(secureServer.getMetrics(), null, 2));
+    return;
+  }
+
+  response.statusCode = 404;
+  response.end("Not Found");
+}).listen(9100, "127.0.0.1");
 ```
 
 ---

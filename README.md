@@ -1,6 +1,6 @@
 # aegis-fluxion
 
-![Version](https://img.shields.io/badge/version-0.7.5-2563eb)
+![Version](https://img.shields.io/badge/version-0.7.6-2563eb)
 ![Node](https://img.shields.io/badge/node-%3E%3D18.18.0-16a34a)
 ![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178c6)
 ![Crypto](https://img.shields.io/badge/Crypto-ECDH%20%2B%20AES--256--GCM-0f172a)
@@ -26,12 +26,15 @@ middleware-based policy controls, and horizontal scaling through Redis Pub/Sub a
 
 ---
 
-## What's new in 0.7.5
+## What's new in 0.7.6
 
-- Added `@aegis-fluxion/browser-client@0.1.0` for frontend/browser runtimes.
-- Browser SDK includes encrypted events, ACK flow, binary payload handling, and chunked streaming.
-- Umbrella package `aegis-fluxion@0.7.5` now re-exports browser client APIs.
-- Root workspace automation (`build`, `typecheck`, `test`, publish scripts) now includes browser-client.
+- Added Observability & Telemetry support in `@aegis-fluxion/core@0.10.0`.
+- `SecureServer` now exposes:
+  - `getMetrics()` for JSON metrics snapshots
+  - `getMetricsPrometheus()` for Prometheus/OpenMetrics scraping
+- Telemetry includes active connections, handshake success/failure,
+  encrypted traffic counters, and blocked DDoS/rate-limit events.
+- Umbrella package `aegis-fluxion@0.7.6` now depends on `@aegis-fluxion/core@^0.10.0`.
 
 ---
 
@@ -271,6 +274,45 @@ serverA.to("ops").emit("ops:alert", {
   from: "server-a",
   message: "Cluster-wide event"
 });
+```
+
+---
+
+## Observability & telemetry
+
+`SecureServer` now provides built-in runtime metrics you can consume directly or expose
+for Prometheus scraping.
+
+```ts
+import { createServer } from "node:http";
+import { SecureServer } from "aegis-fluxion";
+
+const secureServer = new SecureServer({ host: "127.0.0.1", port: 8080 });
+
+const telemetryServer = createServer((request, response) => {
+  if (!request.url) {
+    response.statusCode = 400;
+    response.end("Missing URL");
+    return;
+  }
+
+  if (request.url === "/metrics") {
+    response.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+    response.end(secureServer.getMetricsPrometheus());
+    return;
+  }
+
+  if (request.url === "/metrics.json") {
+    response.setHeader("Content-Type", "application/json; charset=utf-8");
+    response.end(JSON.stringify(secureServer.getMetrics(), null, 2));
+    return;
+  }
+
+  response.statusCode = 404;
+  response.end("Not Found");
+});
+
+telemetryServer.listen(9100, "127.0.0.1");
 ```
 
 ---

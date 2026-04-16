@@ -4,6 +4,24 @@ import WebSocket, { ClientOptions, ServerOptions } from 'ws';
 
 declare const SECURE_SERVER_ADAPTER_MESSAGE_VERSION = 1;
 type SecureChunkSourceValue = Buffer | Uint8Array | ArrayBuffer | string;
+interface SecureServerMetricsSnapshot {
+    serverId: string;
+    timestampMs: number;
+    uptimeSeconds: number;
+    activeConnections: number;
+    totalConnections: number;
+    handshakeSuccessTotal: number;
+    handshakeFailureTotal: number;
+    resumeHandshakeSuccessTotal: number;
+    resumeHandshakeFailureTotal: number;
+    encryptedMessagesSentTotal: number;
+    encryptedMessagesReceivedTotal: number;
+    encryptedBytesSentTotal: number;
+    encryptedBytesReceivedTotal: number;
+    ddosBlockedTotal: number;
+    ddosThrottledTotal: number;
+    ddosDisconnectedTotal: number;
+}
 interface SecureEnvelope<TData = unknown> {
     event: string;
     data: TData;
@@ -153,6 +171,7 @@ type SecureServerMiddleware = (context: SecureServerMiddlewareContext, next: Sec
 declare function normalizeSecureServerAdapterMessage(value: unknown): SecureServerAdapterMessage;
 declare class SecureServer {
     private readonly instanceId;
+    private readonly startedAtMs;
     private readonly socketServer;
     private adapter;
     private readonly heartbeatConfig;
@@ -182,10 +201,13 @@ declare class SecureServer {
     private readonly rateLimitBucketsByClientId;
     private readonly rateLimitBucketsByIp;
     private readonly sessionTicketStore;
+    private readonly telemetryCounters;
     constructor(options: SecureServerOptions);
     get clientCount(): number;
     get serverId(): string;
     get clients(): ReadonlyMap<string, SecureServerClient>;
+    getMetrics(): SecureServerMetricsSnapshot;
+    getMetricsPrometheus(): string;
     setAdapter(adapter: SecureServerAdapter | null): Promise<void>;
     handleAdapterMessage(message: unknown): Promise<void>;
     on(event: "connection", handler: SecureServerConnectionHandler): this;
@@ -209,6 +231,12 @@ declare class SecureServer {
     emitStreamTo(clientId: string, event: string, source: SecureChunkedStreamSource, options?: SecureChunkedStreamOptions): Promise<SecureStreamSendResult>;
     to(room: string): SecureServerRoomOperator;
     close(code?: number, reason?: string): void;
+    private recordHandshakeSuccess;
+    private recordHandshakeFailure;
+    private recordEncryptedMessageSent;
+    private recordEncryptedMessageReceived;
+    private recordDdosBlocked;
+    private recordDdosThrottled;
     private resolveHeartbeatConfig;
     private resolveRateLimitConfig;
     private resolveSessionResumptionConfig;
@@ -357,4 +385,4 @@ declare class SecureClient {
     private flushPendingPayloadQueue;
 }
 
-export { type SecureAckCallback, type SecureAckOptions, type SecureBinaryPayload, type SecureChunkedStreamOptions, type SecureChunkedStreamSource, SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureClientReconnectOptions, type SecureClientSessionResumptionOptions, type SecureClientStreamHandler, type SecureEnvelope, type SecureErrorHandler, type SecureIncomingStreamInfo, SecureServer, type SecureServerAdapter, type SecureServerAdapterMessage, type SecureServerAdapterMessageScope, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerConnectionMiddlewareContext, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerHeartbeatOptions, type SecureServerLifecycleEvent, type SecureServerMessageMiddlewareContext, type SecureServerMiddleware, type SecureServerMiddlewareContext, type SecureServerMiddlewareNext, type SecureServerOptions, type SecureServerRateLimitAction, type SecureServerRateLimitOptions, type SecureServerReadyHandler, type SecureServerRoomOperator, type SecureServerSessionResumptionOptions, type SecureServerStreamHandler, type SecureStreamSendResult, normalizeSecureServerAdapterMessage };
+export { type SecureAckCallback, type SecureAckOptions, type SecureBinaryPayload, type SecureChunkedStreamOptions, type SecureChunkedStreamSource, SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureClientReconnectOptions, type SecureClientSessionResumptionOptions, type SecureClientStreamHandler, type SecureEnvelope, type SecureErrorHandler, type SecureIncomingStreamInfo, SecureServer, type SecureServerAdapter, type SecureServerAdapterMessage, type SecureServerAdapterMessageScope, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerConnectionMiddlewareContext, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerHeartbeatOptions, type SecureServerLifecycleEvent, type SecureServerMessageMiddlewareContext, type SecureServerMetricsSnapshot, type SecureServerMiddleware, type SecureServerMiddlewareContext, type SecureServerMiddlewareNext, type SecureServerOptions, type SecureServerRateLimitAction, type SecureServerRateLimitOptions, type SecureServerReadyHandler, type SecureServerRoomOperator, type SecureServerSessionResumptionOptions, type SecureServerStreamHandler, type SecureStreamSendResult, normalizeSecureServerAdapterMessage };

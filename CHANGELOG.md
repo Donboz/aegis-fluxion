@@ -7,6 +7,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.6] - 2026-04-16
+
+### Added
+
+- `@aegis-fluxion/core` now includes first-class **Observability & Telemetry** for `SecureServer`.
+- New runtime telemetry APIs:
+  - `server.getMetrics()` for structured JSON metrics snapshots.
+  - `server.getMetricsPrometheus()` for Prometheus/OpenMetrics style scraping.
+- Telemetry data points now include:
+  - active secure connection count (gauge)
+  - successful/failed handshakes (including resume handshake outcomes)
+  - encrypted message and byte traffic (ingress/egress counters)
+  - DDoS/rate-limit mitigation counters (blocked, throttled, disconnected)
+- Integration test coverage added for telemetry snapshot integrity, Prometheus output rendering,
+  and handshake failure counter tracking.
+
+### Changed
+
+- `@aegis-fluxion/core` bumped from `0.9.0` to `0.10.0` (minor feature release).
+- Umbrella package `aegis-fluxion` patch-bumped from `0.7.5` to `0.7.6`.
+- Root monorepo version synchronized to `0.7.6` to match the umbrella package.
+- Umbrella dependency updated to `@aegis-fluxion/core@^0.10.0`.
+
+### Security
+
+- Adds visibility into flood mitigation behavior by exposing blocked/throttled/disconnect counters
+  so operators can detect and respond to ongoing abusive traffic patterns in near-real time.
+
 ## [0.7.5] - 2026-04-16
 
 ### Added

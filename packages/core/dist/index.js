@@ -253,6 +253,9 @@ function parseEnvelopeFromText(decodedPayload) {
 function decodeCloseReason(reason) {
   return reason.toString("utf8");
 }
+function escapePrometheusLabelValue(value) {
+  return value.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/"/g, '\\"');
+}
 function isReservedEmitEvent(event) {
   return event === INTERNAL_HANDSHAKE_EVENT || event === INTERNAL_SESSION_TICKET_EVENT || event === INTERNAL_RPC_REQUEST_EVENT || event === INTERNAL_RPC_RESPONSE_EVENT || event === INTERNAL_STREAM_FRAME_EVENT || event === READY_EVENT;
 }
@@ -787,6 +790,7 @@ function decryptSerializedEnvelope(rawData, encryptionKey) {
 }
 var SecureServer = class {
   instanceId = randomUUID();
+  startedAtMs = Date.now();
   socketServer;
   adapter = null;
   heartbeatConfig;
@@ -816,6 +820,20 @@ var SecureServer = class {
   rateLimitBucketsByClientId = /* @__PURE__ */ new Map();
   rateLimitBucketsByIp = /* @__PURE__ */ new Map();
   sessionTicketStore = /* @__PURE__ */ new Map();
+  telemetryCounters = {
+    totalConnections: 0,
+    handshakeSuccessTotal: 0,
+    handshakeFailureTotal: 0,
+    resumeHandshakeSuccessTotal: 0,
+    resumeHandshakeFailureTotal: 0,
+    encryptedMessagesSentTotal: 0,
+    encryptedMessagesReceivedTotal: 0,
+    encryptedBytesSentTotal: 0,
+    encryptedBytesReceivedTotal: 0,
+    ddosBlockedTotal: 0,
+    ddosThrottledTotal: 0,
+    ddosDisconnectedTotal: 0
+  };
   constructor(options) {
     const { heartbeat, rateLimit, sessionResumption, adapter, ...socketServerOptions } = options;
     this.heartbeatConfig = this.resolveHeartbeatConfig(heartbeat);
@@ -838,6 +856,79 @@ var SecureServer = class {
   }
   get clients() {
     return this.clientsById;
+  }
+  getMetrics() {
+    const now = Date.now();
+    const uptimeSeconds = Math.max(0, (now - this.startedAtMs) / 1e3);
+    return {
+      serverId: this.instanceId,
+      timestampMs: now,
+      uptimeSeconds,
+      activeConnections: this.clientCount,
+      totalConnections: this.telemetryCounters.totalConnections,
+      handshakeSuccessTotal: this.telemetryCounters.handshakeSuccessTotal,
+      handshakeFailureTotal: this.telemetryCounters.handshakeFailureTotal,
+      resumeHandshakeSuccessTotal: this.telemetryCounters.resumeHandshakeSuccessTotal,
+      resumeHandshakeFailureTotal: this.telemetryCounters.resumeHandshakeFailureTotal,
+      encryptedMessagesSentTotal: this.telemetryCounters.encryptedMessagesSentTotal,
+      encryptedMessagesReceivedTotal: this.telemetryCounters.encryptedMessagesReceivedTotal,
+      encryptedBytesSentTotal: this.telemetryCounters.encryptedBytesSentTotal,
+      encryptedBytesReceivedTotal: this.telemetryCounters.encryptedBytesReceivedTotal,
+      ddosBlockedTotal: this.telemetryCounters.ddosBlockedTotal,
+      ddosThrottledTotal: this.telemetryCounters.ddosThrottledTotal,
+      ddosDisconnectedTotal: this.telemetryCounters.ddosDisconnectedTotal
+    };
+  }
+  getMetricsPrometheus() {
+    const metrics = this.getMetrics();
+    const labelValue = escapePrometheusLabelValue(metrics.serverId);
+    const labels = `{server_id="${labelValue}"}`;
+    const lines = [
+      "# HELP aegis_fluxion_server_active_connections Number of currently active secure connections.",
+      "# TYPE aegis_fluxion_server_active_connections gauge",
+      `aegis_fluxion_server_active_connections${labels} ${metrics.activeConnections}`,
+      "# HELP aegis_fluxion_server_total_connections_total Total number of accepted secure connections since process start.",
+      "# TYPE aegis_fluxion_server_total_connections_total counter",
+      `aegis_fluxion_server_total_connections_total${labels} ${metrics.totalConnections}`,
+      "# HELP aegis_fluxion_server_uptime_seconds Process uptime in seconds.",
+      "# TYPE aegis_fluxion_server_uptime_seconds gauge",
+      `aegis_fluxion_server_uptime_seconds${labels} ${metrics.uptimeSeconds}`,
+      "# HELP aegis_fluxion_server_handshake_success_total Total successful secure handshakes.",
+      "# TYPE aegis_fluxion_server_handshake_success_total counter",
+      `aegis_fluxion_server_handshake_success_total${labels} ${metrics.handshakeSuccessTotal}`,
+      "# HELP aegis_fluxion_server_handshake_failure_total Total failed secure handshake attempts.",
+      "# TYPE aegis_fluxion_server_handshake_failure_total counter",
+      `aegis_fluxion_server_handshake_failure_total${labels} ${metrics.handshakeFailureTotal}`,
+      "# HELP aegis_fluxion_server_resume_handshake_success_total Total successful session-resume handshakes.",
+      "# TYPE aegis_fluxion_server_resume_handshake_success_total counter",
+      `aegis_fluxion_server_resume_handshake_success_total${labels} ${metrics.resumeHandshakeSuccessTotal}`,
+      "# HELP aegis_fluxion_server_resume_handshake_failure_total Total failed session-resume handshakes.",
+      "# TYPE aegis_fluxion_server_resume_handshake_failure_total counter",
+      `aegis_fluxion_server_resume_handshake_failure_total${labels} ${metrics.resumeHandshakeFailureTotal}`,
+      "# HELP aegis_fluxion_server_encrypted_messages_sent_total Total encrypted messages sent by the server.",
+      "# TYPE aegis_fluxion_server_encrypted_messages_sent_total counter",
+      `aegis_fluxion_server_encrypted_messages_sent_total${labels} ${metrics.encryptedMessagesSentTotal}`,
+      "# HELP aegis_fluxion_server_encrypted_messages_received_total Total encrypted messages received by the server.",
+      "# TYPE aegis_fluxion_server_encrypted_messages_received_total counter",
+      `aegis_fluxion_server_encrypted_messages_received_total${labels} ${metrics.encryptedMessagesReceivedTotal}`,
+      "# HELP aegis_fluxion_server_encrypted_bytes_sent_total Total encrypted bytes sent by the server.",
+      "# TYPE aegis_fluxion_server_encrypted_bytes_sent_total counter",
+      `aegis_fluxion_server_encrypted_bytes_sent_total${labels} ${metrics.encryptedBytesSentTotal}`,
+      "# HELP aegis_fluxion_server_encrypted_bytes_received_total Total encrypted bytes received by the server.",
+      "# TYPE aegis_fluxion_server_encrypted_bytes_received_total counter",
+      `aegis_fluxion_server_encrypted_bytes_received_total${labels} ${metrics.encryptedBytesReceivedTotal}`,
+      "# HELP aegis_fluxion_server_ddos_blocked_total Total DDoS/flood attempts blocked by rate limiting.",
+      "# TYPE aegis_fluxion_server_ddos_blocked_total counter",
+      `aegis_fluxion_server_ddos_blocked_total${labels} ${metrics.ddosBlockedTotal}`,
+      "# HELP aegis_fluxion_server_ddos_throttled_total Total requests slowed down by adaptive throttling.",
+      "# TYPE aegis_fluxion_server_ddos_throttled_total counter",
+      `aegis_fluxion_server_ddos_throttled_total${labels} ${metrics.ddosThrottledTotal}`,
+      "# HELP aegis_fluxion_server_ddos_disconnected_total Total sockets disconnected due to severe rate limit violations.",
+      "# TYPE aegis_fluxion_server_ddos_disconnected_total counter",
+      `aegis_fluxion_server_ddos_disconnected_total${labels} ${metrics.ddosDisconnectedTotal}`
+    ];
+    return `${lines.join("\n")}
+`;
   }
   async setAdapter(adapter) {
     const previousAdapter = this.adapter;
@@ -1146,6 +1237,35 @@ var SecureServer = class {
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to close server."));
     }
+  }
+  recordHandshakeSuccess(resumed) {
+    this.telemetryCounters.handshakeSuccessTotal += 1;
+    if (resumed) {
+      this.telemetryCounters.resumeHandshakeSuccessTotal += 1;
+    }
+  }
+  recordHandshakeFailure(resumed) {
+    this.telemetryCounters.handshakeFailureTotal += 1;
+    if (resumed) {
+      this.telemetryCounters.resumeHandshakeFailureTotal += 1;
+    }
+  }
+  recordEncryptedMessageSent(byteLength) {
+    this.telemetryCounters.encryptedMessagesSentTotal += 1;
+    this.telemetryCounters.encryptedBytesSentTotal += Math.max(0, byteLength);
+  }
+  recordEncryptedMessageReceived(byteLength) {
+    this.telemetryCounters.encryptedMessagesReceivedTotal += 1;
+    this.telemetryCounters.encryptedBytesReceivedTotal += Math.max(0, byteLength);
+  }
+  recordDdosBlocked(disconnected) {
+    this.telemetryCounters.ddosBlockedTotal += 1;
+    if (disconnected) {
+      this.telemetryCounters.ddosDisconnectedTotal += 1;
+    }
+  }
+  recordDdosThrottled() {
+    this.telemetryCounters.ddosThrottledTotal += 1;
   }
   resolveHeartbeatConfig(heartbeatOptions) {
     const intervalMs = heartbeatOptions?.intervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
@@ -1576,6 +1696,7 @@ var SecureServer = class {
         lastPingAt: 0
       });
       this.roomNamesByClientId.set(clientId, /* @__PURE__ */ new Set());
+      this.telemetryCounters.totalConnections += 1;
       socket.on("message", (rawData) => {
         void this.handleIncomingMessage(client, rawData);
       });
@@ -1604,6 +1725,7 @@ var SecureServer = class {
     try {
       const rateLimitDecision = this.evaluateIncomingRateLimit(client);
       if (rateLimitDecision.shouldDisconnect) {
+        this.recordDdosBlocked(true);
         this.notifyError(
           new Error(
             `Rate limit disconnect triggered for client ${client.id}.`
@@ -1618,9 +1740,11 @@ var SecureServer = class {
         return;
       }
       if (rateLimitDecision.shouldDrop) {
+        this.recordDdosBlocked(false);
         return;
       }
       if (rateLimitDecision.throttleDelayMs > 0) {
+        this.recordDdosThrottled();
         this.notifyError(
           new Error(
             `Rate limit throttle applied to client ${client.id} for ${rateLimitDecision.throttleDelayMs}ms.`
@@ -1661,6 +1785,7 @@ var SecureServer = class {
         return;
       }
       let decryptedPayload;
+      const encryptedPayloadByteLength = rawDataToBuffer(rawData).length;
       try {
         decryptedPayload = decryptSerializedEnvelope(rawData, encryptionKey);
       } catch {
@@ -1668,6 +1793,7 @@ var SecureServer = class {
         return;
       }
       const decryptedEnvelope = parseEnvelopeFromText(decryptedPayload);
+      this.recordEncryptedMessageReceived(encryptedPayloadByteLength);
       if (decryptedEnvelope.event === INTERNAL_RPC_RESPONSE_EVENT) {
         this.handleRpcResponse(client.socket, decryptedEnvelope.data);
         return;
@@ -2026,6 +2152,7 @@ var SecureServer = class {
     try {
       const serializedEnvelope = await serializeEnvelope(envelope.event, envelope.data);
       const encryptedPayload = encryptSerializedEnvelope(serializedEnvelope, encryptionKey);
+      this.recordEncryptedMessageSent(encryptedPayload.length);
       socket.send(encryptedPayload);
     } catch (error) {
       const normalizedError = normalizeToError(error, "Failed to send encrypted server payload.");
@@ -2224,6 +2351,7 @@ var SecureServer = class {
   }
   handleResumeHandshake(client, payload) {
     if (!this.sessionResumptionConfig.enabled) {
+      this.recordHandshakeFailure(true);
       this.sendResumeAck(client.socket, {
         ok: false,
         reason: "Session resumption is disabled."
@@ -2232,6 +2360,7 @@ var SecureServer = class {
     }
     const ticketRecord = this.getSessionTicket(payload.sessionId);
     if (!ticketRecord) {
+      this.recordHandshakeFailure(true);
       this.sendResumeAck(client.socket, {
         ok: false,
         reason: "Session ticket is unknown or expired."
@@ -2258,6 +2387,7 @@ var SecureServer = class {
         clientNonce
       );
       if (!equalsConstantTime(receivedProof, expectedProof)) {
+        this.recordHandshakeFailure(true);
         this.sendResumeAck(client.socket, {
           ok: false,
           reason: "Session resumption proof validation failed."
@@ -2278,6 +2408,7 @@ var SecureServer = class {
       this.sharedSecretBySocket.set(client.socket, resumedKey);
       this.encryptionKeyBySocket.set(client.socket, resumedKey);
       handshakeState.isReady = true;
+      this.recordHandshakeSuccess(true);
       this.sendResumeAck(client.socket, {
         ok: true,
         sessionId: ticketRecord.sessionId,
@@ -2287,6 +2418,7 @@ var SecureServer = class {
       this.notifyReady(client);
       this.issueSessionTicket(client.socket, resumedKey);
     } catch (error) {
+      this.recordHandshakeFailure(true);
       this.sendResumeAck(client.socket, {
         ok: false,
         reason: "Session resumption payload was invalid."
@@ -2317,10 +2449,12 @@ var SecureServer = class {
       this.sharedSecretBySocket.set(client.socket, sharedSecret);
       this.encryptionKeyBySocket.set(client.socket, encryptionKey);
       handshakeState.isReady = true;
+      this.recordHandshakeSuccess(false);
       void this.flushQueuedPayloads(client.socket);
       this.notifyReady(client);
       this.issueSessionTicket(client.socket, encryptionKey);
     } catch (error) {
+      this.recordHandshakeFailure(false);
       this.notifyError(normalizeToError(error, "Failed to complete server handshake."));
     }
   }

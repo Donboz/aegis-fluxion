@@ -1,6 +1,6 @@
 {
   "name": "aegis-fluxion-monorepo",
-  "version": "0.7.5",
+  "version": "0.7.6",
   "private": true,
   "description": "Monorepo for the aegis-fluxion E2E encrypted WebSocket toolkit.",
   "workspaces": [

@@ -232,6 +232,40 @@ interface SecureServerRateLimitDecision {
   throttleDelayMs: number;
 }
 
+interface SecureServerTelemetryCounters {
+  totalConnections: number;
+  handshakeSuccessTotal: number;
+  handshakeFailureTotal: number;
+  resumeHandshakeSuccessTotal: number;
+  resumeHandshakeFailureTotal: number;
+  encryptedMessagesSentTotal: number;
+  encryptedMessagesReceivedTotal: number;
+  encryptedBytesSentTotal: number;
+  encryptedBytesReceivedTotal: number;
+  ddosBlockedTotal: number;
+  ddosThrottledTotal: number;
+  ddosDisconnectedTotal: number;
+}
+
+export interface SecureServerMetricsSnapshot {
+  serverId: string;
+  timestampMs: number;
+  uptimeSeconds: number;
+  activeConnections: number;
+  totalConnections: number;
+  handshakeSuccessTotal: number;
+  handshakeFailureTotal: number;
+  resumeHandshakeSuccessTotal: number;
+  resumeHandshakeFailureTotal: number;
+  encryptedMessagesSentTotal: number;
+  encryptedMessagesReceivedTotal: number;
+  encryptedBytesSentTotal: number;
+  encryptedBytesReceivedTotal: number;
+  ddosBlockedTotal: number;
+  ddosThrottledTotal: number;
+  ddosDisconnectedTotal: number;
+}
+
 type BinaryPayloadKind = "buffer" | "uint8array" | "blob";
 
 interface EncodedBinaryPayload {
@@ -759,6 +793,10 @@ function parseEnvelopeFromText(decodedPayload: string): SecureEnvelope {
 
 function decodeCloseReason(reason: Buffer): string {
   return reason.toString("utf8");
+}
+
+function escapePrometheusLabelValue(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/"/g, '\\"');
 }
 
 function isReservedEmitEvent(event: string): boolean {
@@ -1519,6 +1557,8 @@ function decryptSerializedEnvelope(rawData: RawData, encryptionKey: Buffer): str
 export class SecureServer {
   private readonly instanceId = randomUUID();
 
+  private readonly startedAtMs = Date.now();
+
   private readonly socketServer: WebSocketServer;
 
   private adapter: SecureServerAdapter | null = null;
@@ -1595,6 +1635,21 @@ export class SecureServer {
 
   private readonly sessionTicketStore = new Map<string, ServerSessionTicketRecord>();
 
+  private readonly telemetryCounters: SecureServerTelemetryCounters = {
+    totalConnections: 0,
+    handshakeSuccessTotal: 0,
+    handshakeFailureTotal: 0,
+    resumeHandshakeSuccessTotal: 0,
+    resumeHandshakeFailureTotal: 0,
+    encryptedMessagesSentTotal: 0,
+    encryptedMessagesReceivedTotal: 0,
+    encryptedBytesSentTotal: 0,
+    encryptedBytesReceivedTotal: 0,
+    ddosBlockedTotal: 0,
+    ddosThrottledTotal: 0,
+    ddosDisconnectedTotal: 0
+  };
+
   public constructor(options: SecureServerOptions) {
     const { heartbeat, rateLimit, sessionResumption, adapter, ...socketServerOptions } = options;
 
@@ -1622,6 +1677,87 @@ export class SecureServer {
 
   public get clients(): ReadonlyMap<string, SecureServerClient> {
     return this.clientsById;
+  }
+
+  public getMetrics(): SecureServerMetricsSnapshot {
+    const now = Date.now();
+    const uptimeSeconds = Math.max(0, (now - this.startedAtMs) / 1000);
+
+    return {
+      serverId: this.instanceId,
+      timestampMs: now,
+      uptimeSeconds,
+      activeConnections: this.clientCount,
+      totalConnections: this.telemetryCounters.totalConnections,
+      handshakeSuccessTotal: this.telemetryCounters.handshakeSuccessTotal,
+      handshakeFailureTotal: this.telemetryCounters.handshakeFailureTotal,
+      resumeHandshakeSuccessTotal:
+        this.telemetryCounters.resumeHandshakeSuccessTotal,
+      resumeHandshakeFailureTotal:
+        this.telemetryCounters.resumeHandshakeFailureTotal,
+      encryptedMessagesSentTotal:
+        this.telemetryCounters.encryptedMessagesSentTotal,
+      encryptedMessagesReceivedTotal:
+        this.telemetryCounters.encryptedMessagesReceivedTotal,
+      encryptedBytesSentTotal: this.telemetryCounters.encryptedBytesSentTotal,
+      encryptedBytesReceivedTotal: this.telemetryCounters.encryptedBytesReceivedTotal,
+      ddosBlockedTotal: this.telemetryCounters.ddosBlockedTotal,
+      ddosThrottledTotal: this.telemetryCounters.ddosThrottledTotal,
+      ddosDisconnectedTotal: this.telemetryCounters.ddosDisconnectedTotal
+    };
+  }
+
+  public getMetricsPrometheus(): string {
+    const metrics = this.getMetrics();
+    const labelValue = escapePrometheusLabelValue(metrics.serverId);
+    const labels = `{server_id="${labelValue}"}`;
+
+    const lines = [
+      "# HELP aegis_fluxion_server_active_connections Number of currently active secure connections.",
+      "# TYPE aegis_fluxion_server_active_connections gauge",
+      `aegis_fluxion_server_active_connections${labels} ${metrics.activeConnections}`,
+      "# HELP aegis_fluxion_server_total_connections_total Total number of accepted secure connections since process start.",
+      "# TYPE aegis_fluxion_server_total_connections_total counter",
+      `aegis_fluxion_server_total_connections_total${labels} ${metrics.totalConnections}`,
+      "# HELP aegis_fluxion_server_uptime_seconds Process uptime in seconds.",
+      "# TYPE aegis_fluxion_server_uptime_seconds gauge",
+      `aegis_fluxion_server_uptime_seconds${labels} ${metrics.uptimeSeconds}`,
+      "# HELP aegis_fluxion_server_handshake_success_total Total successful secure handshakes.",
+      "# TYPE aegis_fluxion_server_handshake_success_total counter",
+      `aegis_fluxion_server_handshake_success_total${labels} ${metrics.handshakeSuccessTotal}`,
+      "# HELP aegis_fluxion_server_handshake_failure_total Total failed secure handshake attempts.",
+      "# TYPE aegis_fluxion_server_handshake_failure_total counter",
+      `aegis_fluxion_server_handshake_failure_total${labels} ${metrics.handshakeFailureTotal}`,
+      "# HELP aegis_fluxion_server_resume_handshake_success_total Total successful session-resume handshakes.",
+      "# TYPE aegis_fluxion_server_resume_handshake_success_total counter",
+      `aegis_fluxion_server_resume_handshake_success_total${labels} ${metrics.resumeHandshakeSuccessTotal}`,
+      "# HELP aegis_fluxion_server_resume_handshake_failure_total Total failed session-resume handshakes.",
+      "# TYPE aegis_fluxion_server_resume_handshake_failure_total counter",
+      `aegis_fluxion_server_resume_handshake_failure_total${labels} ${metrics.resumeHandshakeFailureTotal}`,
+      "# HELP aegis_fluxion_server_encrypted_messages_sent_total Total encrypted messages sent by the server.",
+      "# TYPE aegis_fluxion_server_encrypted_messages_sent_total counter",
+      `aegis_fluxion_server_encrypted_messages_sent_total${labels} ${metrics.encryptedMessagesSentTotal}`,
+      "# HELP aegis_fluxion_server_encrypted_messages_received_total Total encrypted messages received by the server.",
+      "# TYPE aegis_fluxion_server_encrypted_messages_received_total counter",
+      `aegis_fluxion_server_encrypted_messages_received_total${labels} ${metrics.encryptedMessagesReceivedTotal}`,
+      "# HELP aegis_fluxion_server_encrypted_bytes_sent_total Total encrypted bytes sent by the server.",
+      "# TYPE aegis_fluxion_server_encrypted_bytes_sent_total counter",
+      `aegis_fluxion_server_encrypted_bytes_sent_total${labels} ${metrics.encryptedBytesSentTotal}`,
+      "# HELP aegis_fluxion_server_encrypted_bytes_received_total Total encrypted bytes received by the server.",
+      "# TYPE aegis_fluxion_server_encrypted_bytes_received_total counter",
+      `aegis_fluxion_server_encrypted_bytes_received_total${labels} ${metrics.encryptedBytesReceivedTotal}`,
+      "# HELP aegis_fluxion_server_ddos_blocked_total Total DDoS/flood attempts blocked by rate limiting.",
+      "# TYPE aegis_fluxion_server_ddos_blocked_total counter",
+      `aegis_fluxion_server_ddos_blocked_total${labels} ${metrics.ddosBlockedTotal}`,
+      "# HELP aegis_fluxion_server_ddos_throttled_total Total requests slowed down by adaptive throttling.",
+      "# TYPE aegis_fluxion_server_ddos_throttled_total counter",
+      `aegis_fluxion_server_ddos_throttled_total${labels} ${metrics.ddosThrottledTotal}`,
+      "# HELP aegis_fluxion_server_ddos_disconnected_total Total sockets disconnected due to severe rate limit violations.",
+      "# TYPE aegis_fluxion_server_ddos_disconnected_total counter",
+      `aegis_fluxion_server_ddos_disconnected_total${labels} ${metrics.ddosDisconnectedTotal}`
+    ];
+
+    return `${lines.join("\n")}\n`;
   }
 
   public async setAdapter(adapter: SecureServerAdapter | null): Promise<void> {
@@ -2050,6 +2186,44 @@ export class SecureServer {
     } catch (error) {
       this.notifyError(normalizeToError(error, "Failed to close server."));
     }
+  }
+
+  private recordHandshakeSuccess(resumed: boolean): void {
+    this.telemetryCounters.handshakeSuccessTotal += 1;
+
+    if (resumed) {
+      this.telemetryCounters.resumeHandshakeSuccessTotal += 1;
+    }
+  }
+
+  private recordHandshakeFailure(resumed: boolean): void {
+    this.telemetryCounters.handshakeFailureTotal += 1;
+
+    if (resumed) {
+      this.telemetryCounters.resumeHandshakeFailureTotal += 1;
+    }
+  }
+
+  private recordEncryptedMessageSent(byteLength: number): void {
+    this.telemetryCounters.encryptedMessagesSentTotal += 1;
+    this.telemetryCounters.encryptedBytesSentTotal += Math.max(0, byteLength);
+  }
+
+  private recordEncryptedMessageReceived(byteLength: number): void {
+    this.telemetryCounters.encryptedMessagesReceivedTotal += 1;
+    this.telemetryCounters.encryptedBytesReceivedTotal += Math.max(0, byteLength);
+  }
+
+  private recordDdosBlocked(disconnected: boolean): void {
+    this.telemetryCounters.ddosBlockedTotal += 1;
+
+    if (disconnected) {
+      this.telemetryCounters.ddosDisconnectedTotal += 1;
+    }
+  }
+
+  private recordDdosThrottled(): void {
+    this.telemetryCounters.ddosThrottledTotal += 1;
   }
 
   private resolveHeartbeatConfig(
@@ -2635,6 +2809,7 @@ export class SecureServer {
         lastPingAt: 0
       });
       this.roomNamesByClientId.set(clientId, new Set<string>());
+      this.telemetryCounters.totalConnections += 1;
 
       socket.on("message", (rawData: RawData) => {
         void this.handleIncomingMessage(client, rawData);
@@ -2673,6 +2848,7 @@ export class SecureServer {
       const rateLimitDecision = this.evaluateIncomingRateLimit(client);
 
       if (rateLimitDecision.shouldDisconnect) {
+        this.recordDdosBlocked(true);
         this.notifyError(
           new Error(
             `Rate limit disconnect triggered for client ${client.id}.`
@@ -2693,10 +2869,12 @@ export class SecureServer {
       }
 
       if (rateLimitDecision.shouldDrop) {
+        this.recordDdosBlocked(false);
         return;
       }
 
       if (rateLimitDecision.throttleDelayMs > 0) {
+        this.recordDdosThrottled();
         this.notifyError(
           new Error(
             `Rate limit throttle applied to client ${client.id} for ${rateLimitDecision.throttleDelayMs}ms.`
@@ -2747,6 +2925,7 @@ export class SecureServer {
       }
 
       let decryptedPayload: string;
+      const encryptedPayloadByteLength = rawDataToBuffer(rawData).length;
 
       try {
         decryptedPayload = decryptSerializedEnvelope(rawData, encryptionKey);
@@ -2756,6 +2935,7 @@ export class SecureServer {
       }
 
       const decryptedEnvelope = parseEnvelopeFromText(decryptedPayload);
+      this.recordEncryptedMessageReceived(encryptedPayloadByteLength);
 
       if (decryptedEnvelope.event === INTERNAL_RPC_RESPONSE_EVENT) {
         this.handleRpcResponse(client.socket, decryptedEnvelope.data);
@@ -3234,6 +3414,7 @@ export class SecureServer {
     try {
       const serializedEnvelope = await serializeEnvelope(envelope.event, envelope.data);
       const encryptedPayload = encryptSerializedEnvelope(serializedEnvelope, encryptionKey);
+      this.recordEncryptedMessageSent(encryptedPayload.length);
       socket.send(encryptedPayload);
     } catch (error) {
       const normalizedError = normalizeToError(error, "Failed to send encrypted server payload.");
@@ -3495,6 +3676,7 @@ export class SecureServer {
     payload: HandshakeResumePayload
   ): void {
     if (!this.sessionResumptionConfig.enabled) {
+      this.recordHandshakeFailure(true);
       this.sendResumeAck(client.socket, {
         ok: false,
         reason: "Session resumption is disabled."
@@ -3505,6 +3687,7 @@ export class SecureServer {
     const ticketRecord = this.getSessionTicket(payload.sessionId);
 
     if (!ticketRecord) {
+      this.recordHandshakeFailure(true);
       this.sendResumeAck(client.socket, {
         ok: false,
         reason: "Session ticket is unknown or expired."
@@ -3536,6 +3719,7 @@ export class SecureServer {
       );
 
       if (!equalsConstantTime(receivedProof, expectedProof)) {
+        this.recordHandshakeFailure(true);
         this.sendResumeAck(client.socket, {
           ok: false,
           reason: "Session resumption proof validation failed."
@@ -3560,6 +3744,7 @@ export class SecureServer {
       this.sharedSecretBySocket.set(client.socket, resumedKey);
       this.encryptionKeyBySocket.set(client.socket, resumedKey);
       handshakeState.isReady = true;
+      this.recordHandshakeSuccess(true);
 
       this.sendResumeAck(client.socket, {
         ok: true,
@@ -3571,6 +3756,7 @@ export class SecureServer {
       this.notifyReady(client);
       this.issueSessionTicket(client.socket, resumedKey);
     } catch (error) {
+      this.recordHandshakeFailure(true);
       this.sendResumeAck(client.socket, {
         ok: false,
         reason: "Session resumption payload was invalid."
@@ -3609,11 +3795,13 @@ export class SecureServer {
       this.sharedSecretBySocket.set(client.socket, sharedSecret);
       this.encryptionKeyBySocket.set(client.socket, encryptionKey);
       handshakeState.isReady = true;
+      this.recordHandshakeSuccess(false);
 
       void this.flushQueuedPayloads(client.socket);
       this.notifyReady(client);
       this.issueSessionTicket(client.socket, encryptionKey);
     } catch (error) {
+      this.recordHandshakeFailure(false);
       this.notifyError(normalizeToError(error, "Failed to complete server handshake."));
     }
   }
