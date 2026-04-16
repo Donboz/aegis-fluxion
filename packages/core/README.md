@@ -2,7 +2,7 @@
 
 Low-level encrypted WebSocket primitives for the `aegis-fluxion` ecosystem.
 
-Version: **0.8.0**
+Version: **0.9.0**
 
 ---
 
@@ -11,6 +11,7 @@ Version: **0.8.0**
 - Ephemeral ECDH handshake (`prime256v1`)
 - AES-256-GCM encrypted envelopes
 - ACK request/response (Promise + callback styles)
+- Encrypted chunked streaming for large `Buffer`/`Readable` payloads
 - Secure room routing (`join`, `leave`, `leaveAll`, `to(room).emit(...)`)
 - Middleware phases: `connection`, `incoming`, `outgoing`
 - Rate limiting and DDoS controls per connection and IP
@@ -27,9 +28,84 @@ npm install @aegis-fluxion/core ws
 
 ---
 
+## Chunked streaming (new in 0.9.0)
+
+`@aegis-fluxion/core@0.9.0` adds secure chunked stream transport for large payloads.
+
+### Supported stream sources
+
+- `Buffer`
+- `Uint8Array`
+- `Readable`
+- `AsyncIterable<Buffer | Uint8Array | ArrayBuffer>`
+
+### Stream APIs
+
+- Client outbound: `client.emitStream(event, source, options?)`
+- Client inbound: `client.onStream(event, handler)`
+- Server outbound: `server.emitStreamTo(clientId, event, source, options?)`
+- Server inbound: `server.onStream(event, handler)`
+- Per-client server outbound helper: `serverClient.emitStream(event, source, options?)`
+
+### Options
+
+- `chunkSizeBytes` (default `64 * 1024`, max `1024 * 1024`)
+- `metadata` (optional object attached to the stream start frame)
+- `totalBytes` (optional size hint; required when source size is unknown and you want announced size)
+- `signal` (`AbortSignal` to cancel transfer)
+
+### Example
+
+```ts
+import { Readable } from "node:stream";
+import { SecureClient, SecureServer } from "@aegis-fluxion/core";
+
+const server = new SecureServer({ host: "127.0.0.1", port: 8080 });
+const client = new SecureClient("ws://127.0.0.1:8080");
+
+server.onStream("media:upload", async (stream, info, peer) => {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  const uploaded = Buffer.concat(chunks);
+
+  await peer.emitStream("media:download", Readable.from(uploaded), {
+    chunkSizeBytes: 64 * 1024,
+    totalBytes: uploaded.length,
+    metadata: { direction: "server-to-client" }
+  });
+
+  console.log("Server received stream", {
+    streamId: info.streamId,
+    announcedTotalBytes: info.totalBytes,
+    receivedBytes: uploaded.length
+  });
+});
+
+client.on("ready", async () => {
+  const payload = Buffer.from("chunked secure payload");
+
+  const result = await client.emitStream("media:upload", payload, {
+    chunkSizeBytes: 64 * 1024,
+    totalBytes: payload.length,
+    metadata: { direction: "client-to-server" }
+  });
+
+  console.log(result); // { streamId, chunkCount, totalBytes }
+});
+```
+
+Each chunk is delivered inside reserved internal `start/chunk/end/abort` frames and encrypted
+through the same AES-256-GCM channel used by standard events.
+
+---
+
 ## Session resumption (TLS 1.3-style)
 
-`@aegis-fluxion/core@0.8.0` introduces secure resume-first reconnect behavior:
+`@aegis-fluxion/core@0.8.0` introduced secure resume-first reconnect behavior:
 
 - Full handshake path uses ephemeral ECDH (`hello` frame).
 - Resume path uses ticket-bound proofs (`resume` / `resume-ack` frames).

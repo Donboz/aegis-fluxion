@@ -1,12 +1,35 @@
 import { IncomingMessage } from 'node:http';
+import { Readable } from 'node:stream';
 import WebSocket, { ClientOptions, ServerOptions } from 'ws';
 
 declare const SECURE_SERVER_ADAPTER_MESSAGE_VERSION = 1;
+type SecureChunkSourceValue = Buffer | Uint8Array | ArrayBuffer | string;
 interface SecureEnvelope<TData = unknown> {
     event: string;
     data: TData;
 }
 type SecureBinaryPayload = Buffer | Uint8Array | Blob;
+type SecureChunkedStreamSource = Buffer | Uint8Array | Readable | AsyncIterable<SecureChunkSourceValue>;
+interface SecureChunkedStreamOptions {
+    chunkSizeBytes?: number;
+    metadata?: Record<string, unknown>;
+    totalBytes?: number;
+    signal?: AbortSignal;
+}
+interface SecureStreamSendResult {
+    streamId: string;
+    chunkCount: number;
+    totalBytes: number;
+}
+interface SecureIncomingStreamInfo {
+    streamId: string;
+    event: string;
+    metadata?: Record<string, unknown>;
+    totalBytes?: number;
+    startedAt: number;
+}
+type SecureServerStreamHandler = (stream: Readable, info: SecureIncomingStreamInfo, client: SecureServerClient) => void | Promise<void>;
+type SecureClientStreamHandler = (stream: Readable, info: SecureIncomingStreamInfo) => void | Promise<void>;
 interface SecureAckOptions {
     timeoutMs?: number;
 }
@@ -80,6 +103,7 @@ interface SecureServerClient {
     request: IncomingMessage;
     metadata: ReadonlyMap<string, unknown>;
     emit: (event: string, data: unknown, callbackOrOptions?: SecureAckCallback | SecureAckOptions, maybeCallback?: SecureAckCallback) => boolean | Promise<unknown>;
+    emitStream: (event: string, source: SecureChunkedStreamSource, options?: SecureChunkedStreamOptions) => Promise<SecureStreamSendResult>;
     join: (room: string) => boolean;
     leave: (room: string) => boolean;
     leaveAll: () => number;
@@ -138,6 +162,7 @@ declare class SecureServer {
     private readonly clientsById;
     private readonly clientIdBySocket;
     private readonly customEventHandlers;
+    private readonly streamEventHandlers;
     private readonly connectionHandlers;
     private readonly disconnectHandlers;
     private readonly readyHandlers;
@@ -148,6 +173,7 @@ declare class SecureServer {
     private readonly sharedSecretBySocket;
     private readonly encryptionKeyBySocket;
     private readonly pendingPayloadsBySocket;
+    private readonly incomingStreamsBySocket;
     private readonly pendingRpcRequestsBySocket;
     private readonly heartbeatStateBySocket;
     private readonly roomMembersByName;
@@ -172,12 +198,15 @@ declare class SecureServer {
     off(event: "ready", handler: SecureServerReadyHandler): this;
     off(event: "error", handler: SecureErrorHandler): this;
     off(event: string, handler: SecureServerEventHandler): this;
+    onStream(event: string, handler: SecureServerStreamHandler): this;
+    offStream(event: string, handler: SecureServerStreamHandler): this;
     use(middleware: SecureServerMiddleware): this;
     emit(event: string, data: unknown): this;
     emitTo(clientId: string, event: string, data: unknown): boolean;
     emitTo(clientId: string, event: string, data: unknown, callback: SecureAckCallback): boolean;
     emitTo(clientId: string, event: string, data: unknown, options: SecureAckOptions): Promise<unknown>;
     emitTo(clientId: string, event: string, data: unknown, options: SecureAckOptions, callback: SecureAckCallback): boolean;
+    emitStreamTo(clientId: string, event: string, source: SecureChunkedStreamSource, options?: SecureChunkedStreamOptions): Promise<SecureStreamSendResult>;
     to(room: string): SecureServerRoomOperator;
     close(code?: number, reason?: string): void;
     private resolveHeartbeatConfig;
@@ -205,6 +234,15 @@ declare class SecureServer {
     private handleIncomingMessage;
     private handleDisconnection;
     private dispatchCustomEvent;
+    private getOrCreateIncomingServerStreams;
+    private cleanupIncomingStreamsForSocket;
+    private abortIncomingServerStream;
+    private dispatchServerStreamEvent;
+    private handleIncomingStreamStartFrame;
+    private handleIncomingStreamChunkFrame;
+    private handleIncomingStreamEndFrame;
+    private handleIncomingStreamAbortFrame;
+    private handleIncomingStreamFrame;
     private executeServerMiddleware;
     private applyMessageMiddleware;
     private resolveClientBySocket;
@@ -246,6 +284,7 @@ declare class SecureClient {
     private reconnectTimer;
     private isManualDisconnectRequested;
     private readonly customEventHandlers;
+    private readonly streamEventHandlers;
     private readonly connectHandlers;
     private readonly disconnectHandlers;
     private readonly readyHandlers;
@@ -253,6 +292,7 @@ declare class SecureClient {
     private handshakeState;
     private pendingPayloadQueue;
     private readonly pendingRpcRequests;
+    private readonly incomingStreams;
     private sessionTicket;
     constructor(url: string, options?: SecureClientOptions);
     get readyState(): number | null;
@@ -269,10 +309,13 @@ declare class SecureClient {
     off(event: "ready", handler: SecureClientReadyHandler): this;
     off(event: "error", handler: SecureErrorHandler): this;
     off(event: string, handler: SecureClientEventHandler): this;
+    onStream(event: string, handler: SecureClientStreamHandler): this;
+    offStream(event: string, handler: SecureClientStreamHandler): this;
     emit(event: string, data: unknown): boolean;
     emit(event: string, data: unknown, callback: SecureAckCallback): boolean;
     emit(event: string, data: unknown, options: SecureAckOptions): Promise<unknown>;
     emit(event: string, data: unknown, options: SecureAckOptions, callback: SecureAckCallback): boolean;
+    emitStream(event: string, source: SecureChunkedStreamSource, options?: SecureChunkedStreamOptions): Promise<SecureStreamSendResult>;
     private resolveReconnectConfig;
     private resolveSessionResumptionConfig;
     private scheduleReconnect;
@@ -283,6 +326,14 @@ declare class SecureClient {
     private handleIncomingMessage;
     private handleDisconnect;
     private dispatchCustomEvent;
+    private cleanupIncomingStreams;
+    private abortIncomingClientStream;
+    private dispatchClientStreamEvent;
+    private handleIncomingClientStreamStartFrame;
+    private handleIncomingClientStreamChunkFrame;
+    private handleIncomingClientStreamEndFrame;
+    private handleIncomingClientStreamAbortFrame;
+    private handleIncomingStreamFrame;
     private notifyConnect;
     private notifyReady;
     private notifyError;
@@ -306,4 +357,4 @@ declare class SecureClient {
     private flushPendingPayloadQueue;
 }
 
-export { type SecureAckCallback, type SecureAckOptions, type SecureBinaryPayload, SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureClientReconnectOptions, type SecureClientSessionResumptionOptions, type SecureEnvelope, type SecureErrorHandler, SecureServer, type SecureServerAdapter, type SecureServerAdapterMessage, type SecureServerAdapterMessageScope, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerConnectionMiddlewareContext, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerHeartbeatOptions, type SecureServerLifecycleEvent, type SecureServerMessageMiddlewareContext, type SecureServerMiddleware, type SecureServerMiddlewareContext, type SecureServerMiddlewareNext, type SecureServerOptions, type SecureServerRateLimitAction, type SecureServerRateLimitOptions, type SecureServerReadyHandler, type SecureServerRoomOperator, type SecureServerSessionResumptionOptions, normalizeSecureServerAdapterMessage };
+export { type SecureAckCallback, type SecureAckOptions, type SecureBinaryPayload, type SecureChunkedStreamOptions, type SecureChunkedStreamSource, SecureClient, type SecureClientConnectHandler, type SecureClientDisconnectHandler, type SecureClientEventHandler, type SecureClientEventMap, type SecureClientLifecycleEvent, type SecureClientOptions, type SecureClientReadyHandler, type SecureClientReconnectOptions, type SecureClientSessionResumptionOptions, type SecureClientStreamHandler, type SecureEnvelope, type SecureErrorHandler, type SecureIncomingStreamInfo, SecureServer, type SecureServerAdapter, type SecureServerAdapterMessage, type SecureServerAdapterMessageScope, type SecureServerClient, type SecureServerConnectionHandler, type SecureServerConnectionMiddlewareContext, type SecureServerDisconnectHandler, type SecureServerEventHandler, type SecureServerEventMap, type SecureServerHeartbeatOptions, type SecureServerLifecycleEvent, type SecureServerMessageMiddlewareContext, type SecureServerMiddleware, type SecureServerMiddlewareContext, type SecureServerMiddlewareNext, type SecureServerOptions, type SecureServerRateLimitAction, type SecureServerRateLimitOptions, type SecureServerReadyHandler, type SecureServerRoomOperator, type SecureServerSessionResumptionOptions, type SecureServerStreamHandler, type SecureStreamSendResult, normalizeSecureServerAdapterMessage };

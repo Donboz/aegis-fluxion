@@ -7,6 +7,42 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4] - 2026-04-16
+
+### Added
+
+- Encrypted **chunked streaming transport** for large binary payloads in `@aegis-fluxion/core`.
+- New streaming APIs integrated into secure primitives:
+  - `SecureClient.emitStream(...)`
+  - `SecureClient.onStream(...)`
+  - `SecureServer.emitStreamTo(...)`
+  - `SecureServer.onStream(...)`
+  - `SecureServerClient.emitStream(...)`
+- Stream protocol lifecycle with explicit internal frame types:
+  - `start`
+  - `chunk`
+  - `end`
+  - `abort`
+- Streaming configuration controls:
+  - `chunkSizeBytes` (default `64KB`, max `1MB`)
+  - optional `metadata`
+  - optional `totalBytes`
+  - optional `AbortSignal`
+- Integration tests validating bidirectional stream transfer for large payloads (`Buffer` + `Readable`) with chunk integrity checks.
+
+### Changed
+
+- `@aegis-fluxion/core` bumped from `0.8.0` to `0.9.0` (minor feature release).
+- Umbrella package `aegis-fluxion` patch-bumped from `0.7.3` to `0.7.4`.
+- Root monorepo version synchronized to `0.7.4` to match the umbrella package.
+- Umbrella dependency updated to `@aegis-fluxion/core@^0.9.0`.
+
+### Security
+
+- Stream chunks are transported over reserved internal envelopes and remain AES-256-GCM protected in transit.
+- Incoming stream frames enforce strict ordering and byte-length/total-size validation before delivery to user handlers.
+- Stream lifecycle cleanup now aborts and frees in-flight state on disconnect/close paths.
+
 ## [0.7.3] - 2026-04-15
 
 ### Added

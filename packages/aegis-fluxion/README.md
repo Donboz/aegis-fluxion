@@ -2,7 +2,7 @@
 
 Main end-user package for the `aegis-fluxion` secure messaging ecosystem.
 
-Version: **0.7.3**
+Version: **0.7.4**
 
 ---
 
@@ -19,11 +19,15 @@ without multiple package-level imports.
 
 ---
 
-## What's new in 0.7.3
+## What's new in 0.7.4
 
-- Umbrella package now targets `@aegis-fluxion/core@^0.8.0`.
-- Session resumption is now available through `SecureServer` and `SecureClient` exports.
-- Resume-first reconnects can reuse secure session tickets and fall back safely to full handshake.
+- Umbrella package now targets `@aegis-fluxion/core@^0.9.0`.
+- Chunked streaming is now available from the same top-level exports:
+  - `client.emitStream(...)`
+  - `client.onStream(...)`
+  - `server.emitStreamTo(...)`
+  - `server.onStream(...)`
+- Large payloads are split into ordered encrypted frames (`start/chunk/end/abort`) and validated on receive.
 
 ---
 
@@ -84,6 +88,45 @@ const client = new SecureClient("ws://127.0.0.1:8080", {
 
 client.on("ready", () => {
   console.log("Secure channel is ready (resumed or full handshake).");
+});
+```
+
+---
+
+## Chunked streaming quick example
+
+```ts
+import { SecureClient, SecureServer } from "aegis-fluxion";
+
+const server = new SecureServer({ host: "127.0.0.1", port: 8080 });
+const client = new SecureClient("ws://127.0.0.1:8080");
+
+server.onStream("blob:upload", async (stream, info) => {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  const fullBuffer = Buffer.concat(chunks);
+
+  console.log("Received stream", {
+    streamId: info.streamId,
+    announcedTotalBytes: info.totalBytes,
+    receivedBytes: fullBuffer.length
+  });
+});
+
+client.on("ready", async () => {
+  const payload = Buffer.from("large payload");
+
+  const result = await client.emitStream("blob:upload", payload, {
+    chunkSizeBytes: 64 * 1024,
+    totalBytes: payload.length,
+    metadata: { source: "client" }
+  });
+
+  console.log(result);
 });
 ```
 

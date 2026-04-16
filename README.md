@@ -1,6 +1,6 @@
 # aegis-fluxion
 
-![Version](https://img.shields.io/badge/version-0.7.3-2563eb)
+![Version](https://img.shields.io/badge/version-0.7.4-2563eb)
 ![Node](https://img.shields.io/badge/node-%3E%3D18.18.0-16a34a)
 ![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178c6)
 ![Crypto](https://img.shields.io/badge/Crypto-ECDH%20%2B%20AES--256--GCM-0f172a)
@@ -9,6 +9,7 @@
 
 It provides secure event transport with ephemeral ECDH key exchange, AES-256-GCM envelopes,
 TLS 1.3-style session resumption, ACK request/response semantics, binary payload support,
+chunked streaming for large payload transfers,
 middleware-based policy controls, and horizontal scaling through Redis Pub/Sub adapters.
 
 ---
@@ -24,12 +25,16 @@ middleware-based policy controls, and horizontal scaling through Redis Pub/Sub a
 
 ---
 
-## What's new in 0.7.3
+## What's new in 0.7.4
 
-- Added TLS 1.3-style **session resumption** to secure reconnect flows.
-- Clients can attempt resume-first handshakes and automatically fall back to full ECDH.
-- Servers now issue encrypted one-time session tickets with configurable TTL and cache limits.
-- Umbrella package now targets `@aegis-fluxion/core@^0.8.0`.
+- Added encrypted **chunked streaming** support for large payload transfers.
+- New stream APIs are now available from umbrella exports:
+  - `client.emitStream(...)`
+  - `client.onStream(...)`
+  - `server.emitStreamTo(...)`
+  - `server.onStream(...)`
+- Each stream is transmitted through ordered `start/chunk/end/abort` internal frames and protected by AES-256-GCM.
+- Umbrella package now targets `@aegis-fluxion/core@^0.9.0`.
 
 ---
 
@@ -125,6 +130,64 @@ resume directly with authenticated resume proofs.
 
 ---
 
+## Chunked streaming example
+
+```ts
+import { SecureClient, SecureServer } from "aegis-fluxion";
+
+const server = new SecureServer({ host: "127.0.0.1", port: 8080 });
+const client = new SecureClient("ws://127.0.0.1:8080");
+
+server.onStream("files:upload", async (stream, info, peer) => {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  const uploaded = Buffer.concat(chunks);
+
+  // Stream back to the same peer (for example, checksum response or transformed file)
+  await peer.emitStream("files:download", uploaded, {
+    chunkSizeBytes: 64 * 1024,
+    metadata: { source: "server" }
+  });
+
+  console.log("Upload complete", {
+    streamId: info.streamId,
+    totalBytes: uploaded.length
+  });
+});
+
+client.on("ready", async () => {
+  const payload = Buffer.from("large binary payload here");
+
+  const result = await client.emitStream("files:upload", payload, {
+    chunkSizeBytes: 64 * 1024,
+    metadata: { source: "client" },
+    totalBytes: payload.length
+  });
+
+  console.log(result); // { streamId, chunkCount, totalBytes }
+});
+
+client.onStream("files:download", async (stream, info) => {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  console.log("Download complete", {
+    streamId: info.streamId,
+    announcedTotalBytes: info.totalBytes,
+    receivedBytes: Buffer.concat(chunks).length
+  });
+});
+```
+
+---
+
 ## Horizontal scaling with Redis
 
 ```ts
@@ -165,6 +228,7 @@ serverA.to("ops").emit("ops:alert", {
 - Ephemeral ECDH handshake (`prime256v1`)
 - AES-256-GCM authenticated encryption for all application payloads
 - Binary payload support (`Buffer`, `Uint8Array`, `Blob`)
+- Encrypted chunked streaming (`Buffer`, `Uint8Array`, `Readable`, `AsyncIterable`)
 - TLS 1.3-style session resumption with encrypted one-time tickets
 - ACK request/response with timeout controls
 - Rate limiting and DDoS controls (per connection + per IP)

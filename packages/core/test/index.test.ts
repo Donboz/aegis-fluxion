@@ -1,5 +1,6 @@
 import { createECDH, randomBytes } from "node:crypto";
 import { createServer } from "node:net";
+import { Readable } from "node:stream";
 import WebSocket from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -73,6 +74,31 @@ function createTamperedPacket(): Buffer {
   const forgedCiphertext = randomBytes(32);
 
   return Buffer.concat([packetVersion, iv, authTag, forgedCiphertext]);
+}
+
+async function readStreamToBuffer(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of stream) {
+    if (Buffer.isBuffer(chunk)) {
+      chunks.push(chunk);
+      continue;
+    }
+
+    if (chunk instanceof Uint8Array) {
+      chunks.push(Buffer.from(chunk));
+      continue;
+    }
+
+    if (typeof chunk === "string") {
+      chunks.push(Buffer.from(chunk));
+      continue;
+    }
+
+    throw new Error("Stream yielded an unsupported chunk type.");
+  }
+
+  return Buffer.concat(chunks);
 }
 
 class InMemorySecureServerAdapter implements SecureServerAdapter {
@@ -1593,6 +1619,137 @@ describe("SecureServer and SecureClient encryption flow", () => {
 
       await wait(50);
       expect(server.clientCount).toBe(0);
+    } finally {
+      client.disconnect();
+      server.close();
+      await wait(30);
+    }
+  });
+
+  it("transfers large payloads as encrypted chunked streams in both directions", async () => {
+    const port = await getFreePort();
+    const server = new SecureServer({ port, host: "127.0.0.1" });
+    const client = new SecureClient(`ws://127.0.0.1:${port}`, {
+      reconnect: false
+    });
+
+    const chunkSize = 32 * 1024;
+    const uploadPayload = randomBytes(240_000);
+
+    try {
+      const incomingServerStreamPromise = withTimeout(
+        new Promise<{
+          received: Buffer;
+          outboundChunkCount: number;
+          outboundTotalBytes: number;
+          metadata: unknown;
+          announcedTotalBytes?: number;
+        }>((resolve, reject) => {
+          server.onStream("stream:upload", (stream, info, serverClient) => {
+            void (async () => {
+              try {
+                const received = await readStreamToBuffer(stream);
+                const outboundResult = await serverClient.emitStream(
+                  "stream:download",
+                  Readable.from(received),
+                  {
+                    chunkSizeBytes: chunkSize,
+                    totalBytes: received.length,
+                    metadata: {
+                      direction: "server-to-client"
+                    }
+                  }
+                );
+
+                resolve({
+                  received,
+                  outboundChunkCount: outboundResult.chunkCount,
+                  outboundTotalBytes: outboundResult.totalBytes,
+                  metadata: info.metadata,
+                  announcedTotalBytes: info.totalBytes
+                });
+              } catch (error) {
+                reject(error as Error);
+              }
+            })();
+          });
+        }),
+        TEST_TIMEOUT_MS,
+        "server incoming chunked stream"
+      );
+
+      const incomingClientStreamPromise = withTimeout(
+        new Promise<{ received: Buffer; metadata: unknown; announcedTotalBytes?: number }>(
+          (resolve, reject) => {
+            client.onStream("stream:download", (stream, info) => {
+              void (async () => {
+                try {
+                  const received = await readStreamToBuffer(stream);
+
+                  resolve({
+                    received,
+                    metadata: info.metadata,
+                    announcedTotalBytes: info.totalBytes
+                  });
+                } catch (error) {
+                  reject(error as Error);
+                }
+              })();
+            });
+          }
+        ),
+        TEST_TIMEOUT_MS,
+        "client incoming chunked stream"
+      );
+
+      await Promise.all([
+        withTimeout(
+          new Promise<void>((resolve) => {
+            server.on("ready", () => {
+              resolve();
+            });
+          }),
+          TEST_TIMEOUT_MS,
+          "server ready for chunked streaming"
+        ),
+        withTimeout(
+          new Promise<void>((resolve) => {
+            client.on("ready", () => {
+              resolve();
+            });
+          }),
+          TEST_TIMEOUT_MS,
+          "client ready for chunked streaming"
+        )
+      ]);
+
+      const uploadResult = await client.emitStream("stream:upload", uploadPayload, {
+        chunkSizeBytes: chunkSize,
+        metadata: {
+          direction: "client-to-server"
+        }
+      });
+
+      const [serverStreamResult, clientStreamResult] = await Promise.all([
+        incomingServerStreamPromise,
+        incomingClientStreamPromise
+      ]);
+
+      const expectedChunkCount = Math.ceil(uploadPayload.length / chunkSize);
+
+      expect(uploadResult.chunkCount).toBe(expectedChunkCount);
+      expect(uploadResult.totalBytes).toBe(uploadPayload.length);
+
+      expect(serverStreamResult.received.equals(uploadPayload)).toBe(true);
+      expect(serverStreamResult.metadata).toEqual({ direction: "client-to-server" });
+      expect(serverStreamResult.announcedTotalBytes).toBe(uploadPayload.length);
+
+      expect(serverStreamResult.outboundChunkCount).toBe(expectedChunkCount);
+      expect(serverStreamResult.outboundTotalBytes).toBe(uploadPayload.length);
+
+      expect(clientStreamResult.received.equals(uploadPayload)).toBe(true);
+      expect(clientStreamResult.metadata).toEqual({ direction: "server-to-client" });
+      expect(clientStreamResult.announcedTotalBytes).toBe(uploadPayload.length);
     } finally {
       client.disconnect();
       server.close();

@@ -10,6 +10,7 @@ import {
 } from "node:crypto";
 import type { ECDH } from "node:crypto";
 import type { IncomingMessage } from "node:http";
+import { PassThrough, Readable } from "node:stream";
 import WebSocket, { WebSocketServer } from "ws";
 import type {
   ClientOptions,
@@ -25,6 +26,7 @@ const INTERNAL_HANDSHAKE_EVENT = "__handshake";
 const INTERNAL_SESSION_TICKET_EVENT = "__session:ticket";
 const INTERNAL_RPC_REQUEST_EVENT = "__rpc:req";
 const INTERNAL_RPC_RESPONSE_EVENT = "__rpc:res";
+const INTERNAL_STREAM_FRAME_EVENT = "__stream:frame";
 const READY_EVENT = "ready";
 const HANDSHAKE_CURVE = "prime256v1";
 const HANDSHAKE_PROTOCOL_VERSION = 1;
@@ -42,6 +44,9 @@ const DEFAULT_HEARTBEAT_TIMEOUT_MS = 15_000;
 const DEFAULT_SESSION_RESUMPTION_ENABLED = true;
 const DEFAULT_SESSION_TICKET_TTL_MS = 10 * 60_000;
 const DEFAULT_SESSION_TICKET_MAX_CACHE_SIZE = 10_000;
+const STREAM_FRAME_VERSION = 1;
+const DEFAULT_STREAM_CHUNK_SIZE_BYTES = 64 * 1024;
+const MAX_STREAM_CHUNK_SIZE_BYTES = 1024 * 1024;
 const RESUMPTION_NONCE_LENGTH = 16;
 const DEFAULT_RECONNECT_INITIAL_DELAY_MS = 250;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 10_000;
@@ -158,6 +163,61 @@ interface PendingRpcRequest {
   timeoutHandle: ReturnType<typeof setTimeout>;
 }
 
+type SecureChunkSourceValue = Buffer | Uint8Array | ArrayBuffer | string;
+
+interface StreamFrameStartPayload {
+  version: typeof STREAM_FRAME_VERSION;
+  type: "start";
+  streamId: string;
+  event: string;
+  metadata?: Record<string, unknown>;
+  totalBytes?: number;
+}
+
+interface StreamFrameChunkPayload {
+  version: typeof STREAM_FRAME_VERSION;
+  type: "chunk";
+  streamId: string;
+  index: number;
+  payload: string;
+  byteLength: number;
+}
+
+interface StreamFrameEndPayload {
+  version: typeof STREAM_FRAME_VERSION;
+  type: "end";
+  streamId: string;
+  chunkCount: number;
+  totalBytes: number;
+}
+
+interface StreamFrameAbortPayload {
+  version: typeof STREAM_FRAME_VERSION;
+  type: "abort";
+  streamId: string;
+  reason: string;
+}
+
+type StreamFramePayload =
+  | StreamFrameStartPayload
+  | StreamFrameChunkPayload
+  | StreamFrameEndPayload
+  | StreamFrameAbortPayload;
+
+interface IncomingServerStreamState {
+  info: SecureIncomingStreamInfo;
+  stream: PassThrough;
+  expectedChunkIndex: number;
+  receivedBytes: number;
+}
+
+interface IncomingClientStreamState {
+  info: SecureIncomingStreamInfo;
+  stream: PassThrough;
+  expectedChunkIndex: number;
+  receivedBytes: number;
+}
+
 interface SecureServerRateLimitBucket {
   windowStartedAt: number;
   count: number;
@@ -187,6 +247,44 @@ export interface SecureEnvelope<TData = unknown> {
 }
 
 export type SecureBinaryPayload = Buffer | Uint8Array | Blob;
+
+export type SecureChunkedStreamSource =
+  | Buffer
+  | Uint8Array
+  | Readable
+  | AsyncIterable<SecureChunkSourceValue>;
+
+export interface SecureChunkedStreamOptions {
+  chunkSizeBytes?: number;
+  metadata?: Record<string, unknown>;
+  totalBytes?: number;
+  signal?: AbortSignal;
+}
+
+export interface SecureStreamSendResult {
+  streamId: string;
+  chunkCount: number;
+  totalBytes: number;
+}
+
+export interface SecureIncomingStreamInfo {
+  streamId: string;
+  event: string;
+  metadata?: Record<string, unknown>;
+  totalBytes?: number;
+  startedAt: number;
+}
+
+export type SecureServerStreamHandler = (
+  stream: Readable,
+  info: SecureIncomingStreamInfo,
+  client: SecureServerClient
+) => void | Promise<void>;
+
+export type SecureClientStreamHandler = (
+  stream: Readable,
+  info: SecureIncomingStreamInfo
+) => void | Promise<void>;
 
 export interface SecureAckOptions {
   timeoutMs?: number;
@@ -282,6 +380,11 @@ export interface SecureServerClient {
     callbackOrOptions?: SecureAckCallback | SecureAckOptions,
     maybeCallback?: SecureAckCallback
   ) => boolean | Promise<unknown>;
+  emitStream: (
+    event: string,
+    source: SecureChunkedStreamSource,
+    options?: SecureChunkedStreamOptions
+  ) => Promise<SecureStreamSendResult>;
   join: (room: string) => boolean;
   leave: (room: string) => boolean;
   leaveAll: () => number;
@@ -664,6 +767,7 @@ function isReservedEmitEvent(event: string): boolean {
     event === INTERNAL_SESSION_TICKET_EVENT ||
     event === INTERNAL_RPC_REQUEST_EVENT ||
     event === INTERNAL_RPC_RESPONSE_EVENT ||
+    event === INTERNAL_STREAM_FRAME_EVENT ||
     event === READY_EVENT
   );
 }
@@ -680,6 +784,336 @@ function normalizeRpcTimeout(timeoutMs: number | undefined): number {
   }
 
   return resolvedTimeoutMs;
+}
+
+function normalizeStreamChunkSize(chunkSizeBytes: number | undefined): number {
+  const resolvedChunkSize = chunkSizeBytes ?? DEFAULT_STREAM_CHUNK_SIZE_BYTES;
+
+  if (!Number.isInteger(resolvedChunkSize) || resolvedChunkSize <= 0) {
+    throw new Error("Stream chunkSizeBytes must be a positive integer.");
+  }
+
+  if (resolvedChunkSize > MAX_STREAM_CHUNK_SIZE_BYTES) {
+    throw new Error(
+      `Stream chunkSizeBytes cannot exceed ${MAX_STREAM_CHUNK_SIZE_BYTES} bytes.`
+    );
+  }
+
+  return resolvedChunkSize;
+}
+
+function resolveKnownStreamSourceSize(
+  source: SecureChunkedStreamSource,
+  hint: number | undefined
+): number | undefined {
+  if (hint !== undefined) {
+    if (!Number.isInteger(hint) || hint < 0) {
+      throw new Error("Stream totalBytes must be a non-negative integer.");
+    }
+
+    return hint;
+  }
+
+  if (Buffer.isBuffer(source)) {
+    return source.length;
+  }
+
+  if (source instanceof Uint8Array) {
+    return source.byteLength;
+  }
+
+  return undefined;
+}
+
+function normalizeChunkSourceValue(value: unknown): Buffer {
+  if (Buffer.isBuffer(value)) {
+    return value;
+  }
+
+  if (value instanceof Uint8Array) {
+    return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  }
+
+  if (value instanceof ArrayBuffer) {
+    return Buffer.from(value);
+  }
+
+  if (typeof value === "string") {
+    return Buffer.from(value, "utf8");
+  }
+
+  throw new Error("Stream source yielded an unsupported chunk value.");
+}
+
+function isAsyncIterableValue(value: unknown): value is AsyncIterable<unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    Symbol.asyncIterator in value
+  );
+}
+
+function isReadableSource(value: unknown): value is Readable {
+  return value instanceof Readable;
+}
+
+function splitChunkBuffer(chunk: Buffer, chunkSizeBytes: number): Buffer[] {
+  if (chunk.length <= chunkSizeBytes) {
+    return [chunk];
+  }
+
+  const splitChunks: Buffer[] = [];
+
+  for (let offset = 0; offset < chunk.length; offset += chunkSizeBytes) {
+    splitChunks.push(chunk.subarray(offset, offset + chunkSizeBytes));
+  }
+
+  return splitChunks;
+}
+
+async function* createChunkStreamIterator(
+  source: SecureChunkedStreamSource,
+  chunkSizeBytes: number
+): AsyncGenerator<Buffer> {
+  if (Buffer.isBuffer(source)) {
+    yield* splitChunkBuffer(source, chunkSizeBytes);
+    return;
+  }
+
+  if (source instanceof Uint8Array) {
+    yield* splitChunkBuffer(
+      Buffer.from(source.buffer, source.byteOffset, source.byteLength),
+      chunkSizeBytes
+    );
+    return;
+  }
+
+  if (isReadableSource(source) || isAsyncIterableValue(source)) {
+    for await (const chunkValue of source) {
+      const normalizedChunk = normalizeChunkSourceValue(chunkValue);
+
+      if (normalizedChunk.length === 0) {
+        continue;
+      }
+
+      yield* splitChunkBuffer(normalizedChunk, chunkSizeBytes);
+    }
+
+    return;
+  }
+
+  throw new Error("Unsupported stream source type.");
+}
+
+function parseStreamFramePayload(data: unknown): StreamFramePayload {
+  if (typeof data !== "object" || data === null) {
+    throw new Error("Invalid stream frame payload format.");
+  }
+
+  const payload = data as Partial<StreamFramePayload> & {
+    metadata?: unknown;
+  };
+
+  if (payload.version !== STREAM_FRAME_VERSION) {
+    throw new Error(`Unsupported stream frame version: ${String(payload.version)}.`);
+  }
+
+  if (typeof payload.streamId !== "string" || payload.streamId.trim().length === 0) {
+    throw new Error("Stream frame streamId must be a non-empty string.");
+  }
+
+  if (payload.type === "start") {
+    if (typeof payload.event !== "string" || payload.event.trim().length === 0) {
+      throw new Error("Stream start frame event must be a non-empty string.");
+    }
+
+    if (
+      payload.totalBytes !== undefined &&
+      (!Number.isInteger(payload.totalBytes) || payload.totalBytes < 0)
+    ) {
+      throw new Error("Stream start frame totalBytes must be a non-negative integer.");
+    }
+
+    if (payload.metadata !== undefined && !isPlainObject(payload.metadata)) {
+      throw new Error("Stream start frame metadata must be a plain object when provided.");
+    }
+
+    return {
+      version: STREAM_FRAME_VERSION,
+      type: "start",
+      streamId: payload.streamId.trim(),
+      event: payload.event.trim(),
+      ...(payload.metadata ? { metadata: payload.metadata } : {}),
+      ...(payload.totalBytes !== undefined
+        ? { totalBytes: payload.totalBytes }
+        : {})
+    };
+  }
+
+  if (payload.type === "chunk") {
+    const { index, byteLength } = payload;
+
+    if (typeof index !== "number" || !Number.isInteger(index) || index < 0) {
+      throw new Error("Stream chunk frame index must be a non-negative integer.");
+    }
+
+    if (typeof payload.payload !== "string" || payload.payload.length === 0) {
+      throw new Error("Stream chunk frame payload must be a non-empty base64 string.");
+    }
+
+    if (
+      typeof byteLength !== "number" ||
+      !Number.isInteger(byteLength) ||
+      byteLength <= 0
+    ) {
+      throw new Error("Stream chunk frame byteLength must be a positive integer.");
+    }
+
+    return {
+      version: STREAM_FRAME_VERSION,
+      type: "chunk",
+      streamId: payload.streamId.trim(),
+      index,
+      payload: payload.payload,
+      byteLength
+    };
+  }
+
+  if (payload.type === "end") {
+    const { chunkCount, totalBytes } = payload;
+
+    if (
+      typeof chunkCount !== "number" ||
+      !Number.isInteger(chunkCount) ||
+      chunkCount < 0
+    ) {
+      throw new Error("Stream end frame chunkCount must be a non-negative integer.");
+    }
+
+    if (
+      typeof totalBytes !== "number" ||
+      !Number.isInteger(totalBytes) ||
+      totalBytes < 0
+    ) {
+      throw new Error("Stream end frame totalBytes must be a non-negative integer.");
+    }
+
+    return {
+      version: STREAM_FRAME_VERSION,
+      type: "end",
+      streamId: payload.streamId.trim(),
+      chunkCount,
+      totalBytes
+    };
+  }
+
+  if (payload.type === "abort") {
+    if (typeof payload.reason !== "string" || payload.reason.trim().length === 0) {
+      throw new Error("Stream abort frame reason must be a non-empty string.");
+    }
+
+    return {
+      version: STREAM_FRAME_VERSION,
+      type: "abort",
+      streamId: payload.streamId.trim(),
+      reason: payload.reason.trim()
+    };
+  }
+
+  throw new Error("Unsupported stream frame type.");
+}
+
+async function transmitChunkedStreamFrames(
+  event: string,
+  source: SecureChunkedStreamSource,
+  options: SecureChunkedStreamOptions | undefined,
+  sendFrame: (framePayload: StreamFramePayload) => Promise<void>
+): Promise<SecureStreamSendResult> {
+  const chunkSizeBytes = normalizeStreamChunkSize(options?.chunkSizeBytes);
+  const totalBytesHint = resolveKnownStreamSourceSize(source, options?.totalBytes);
+
+  if (options?.metadata !== undefined && !isPlainObject(options.metadata)) {
+    throw new Error("Stream metadata must be a plain object when provided.");
+  }
+
+  if (options?.signal?.aborted) {
+    throw new Error("Stream transfer aborted before dispatch.");
+  }
+
+  const streamId = randomUUID();
+  let chunkCount = 0;
+  let totalBytes = 0;
+
+  await sendFrame({
+    version: STREAM_FRAME_VERSION,
+    type: "start",
+    streamId,
+    event,
+    ...(options?.metadata ? { metadata: options.metadata } : {}),
+    ...(totalBytesHint !== undefined ? { totalBytes: totalBytesHint } : {})
+  });
+
+  try {
+    for await (const chunkBuffer of createChunkStreamIterator(source, chunkSizeBytes)) {
+      if (options?.signal?.aborted) {
+        throw new Error("Stream transfer aborted by caller signal.");
+      }
+
+      if (chunkBuffer.length === 0) {
+        continue;
+      }
+
+      await sendFrame({
+        version: STREAM_FRAME_VERSION,
+        type: "chunk",
+        streamId,
+        index: chunkCount,
+        payload: chunkBuffer.toString("base64"),
+        byteLength: chunkBuffer.length
+      });
+
+      chunkCount += 1;
+      totalBytes += chunkBuffer.length;
+    }
+
+    if (totalBytesHint !== undefined && totalBytes !== totalBytesHint) {
+      throw new Error(
+        `Stream totalBytes mismatch. Expected ${totalBytesHint}, received ${totalBytes}.`
+      );
+    }
+
+    await sendFrame({
+      version: STREAM_FRAME_VERSION,
+      type: "end",
+      streamId,
+      chunkCount,
+      totalBytes
+    });
+
+    return {
+      streamId,
+      chunkCount,
+      totalBytes
+    };
+  } catch (error) {
+    const normalizedError = normalizeToError(
+      error,
+      `Chunked stream transfer failed for event "${event}".`
+    );
+
+    try {
+      await sendFrame({
+        version: STREAM_FRAME_VERSION,
+        type: "abort",
+        streamId,
+        reason: normalizedError.message
+      });
+    } catch {
+      // Best effort abort frame dispatch.
+    }
+
+    throw normalizedError;
+  }
 }
 
 function parseRpcRequestPayload(data: unknown): RpcRequestPayload {
@@ -1103,6 +1537,8 @@ export class SecureServer {
 
   private readonly customEventHandlers = new Map<string, Set<SecureServerEventHandler>>();
 
+  private readonly streamEventHandlers = new Map<string, Set<SecureServerStreamHandler>>();
+
   private readonly connectionHandlers = new Set<SecureServerConnectionHandler>();
 
   private readonly disconnectHandlers = new Set<SecureServerDisconnectHandler>();
@@ -1125,6 +1561,11 @@ export class SecureServer {
   private readonly encryptionKeyBySocket = new WeakMap<WebSocket, Buffer>();
 
   private readonly pendingPayloadsBySocket = new WeakMap<WebSocket, SecureEnvelope[]>();
+
+  private readonly incomingStreamsBySocket = new WeakMap<
+    WebSocket,
+    Map<string, IncomingServerStreamState>
+  >();
 
   private readonly pendingRpcRequestsBySocket = new WeakMap<
     WebSocket,
@@ -1339,6 +1780,46 @@ export class SecureServer {
     return this;
   }
 
+  public onStream(event: string, handler: SecureServerStreamHandler): this {
+    try {
+      if (isReservedEmitEvent(event)) {
+        throw new Error(`The event "${event}" is reserved and cannot be used as a stream event.`);
+      }
+
+      const listeners = this.streamEventHandlers.get(event) ?? new Set<SecureServerStreamHandler>();
+      listeners.add(handler);
+      this.streamEventHandlers.set(event, listeners);
+    } catch (error) {
+      this.notifyError(
+        normalizeToError(error, "Failed to register server stream handler.")
+      );
+    }
+
+    return this;
+  }
+
+  public offStream(event: string, handler: SecureServerStreamHandler): this {
+    try {
+      const listeners = this.streamEventHandlers.get(event);
+
+      if (!listeners) {
+        return this;
+      }
+
+      listeners.delete(handler);
+
+      if (listeners.size === 0) {
+        this.streamEventHandlers.delete(event);
+      }
+    } catch (error) {
+      this.notifyError(
+        normalizeToError(error, "Failed to remove server stream handler.")
+      );
+    }
+
+    return this;
+  }
+
   public use(middleware: SecureServerMiddleware): this {
     try {
       if (typeof middleware !== "function") {
@@ -1460,6 +1941,51 @@ export class SecureServer {
     }
   }
 
+  public async emitStreamTo(
+    clientId: string,
+    event: string,
+    source: SecureChunkedStreamSource,
+    options?: SecureChunkedStreamOptions
+  ): Promise<SecureStreamSendResult> {
+    try {
+      if (isReservedEmitEvent(event)) {
+        throw new Error(`The event "${event}" is reserved and cannot be emitted manually.`);
+      }
+
+      const client = this.clientsById.get(clientId);
+
+      if (!client) {
+        throw new Error(`Client with id ${clientId} was not found.`);
+      }
+
+      if (!this.isClientHandshakeReady(client.socket)) {
+        throw new Error(
+          `Cannot stream event "${event}" before secure handshake completion for client ${client.id}.`
+        );
+      }
+
+      return await transmitChunkedStreamFrames(
+        event,
+        source,
+        options,
+        async (framePayload) => {
+          await this.sendEncryptedEnvelope(client.socket, {
+            event: INTERNAL_STREAM_FRAME_EVENT,
+            data: framePayload
+          });
+        }
+      );
+    } catch (error) {
+      const normalizedError = normalizeToError(
+        error,
+        `Failed to emit chunked stream event "${event}" to client ${clientId}.`
+      );
+
+      this.notifyError(normalizedError);
+      throw normalizedError;
+    }
+  }
+
   public to(room: string): SecureServerRoomOperator {
     const normalizedRoom = this.normalizeRoomName(room);
 
@@ -1500,6 +2026,10 @@ export class SecureServer {
         this.rejectPendingRpcRequests(
           client.socket,
           new Error("Server closed before ACK response was received.")
+        );
+        this.cleanupIncomingStreamsForSocket(
+          client.socket,
+          "Server closed before stream transfer completed."
         );
         this.middlewareMetadataBySocket.delete(client.socket);
 
@@ -2237,6 +2767,11 @@ export class SecureServer {
         return;
       }
 
+      if (decryptedEnvelope.event === INTERNAL_STREAM_FRAME_EVENT) {
+        this.handleIncomingStreamFrame(client, decryptedEnvelope.data);
+        return;
+      }
+
       if (decryptedEnvelope.event === INTERNAL_SESSION_TICKET_EVENT) {
         this.notifyError(
           new Error(
@@ -2285,6 +2820,10 @@ export class SecureServer {
       this.pendingRpcRequestsBySocket.delete(client.socket);
       this.heartbeatStateBySocket.delete(client.socket);
       this.middlewareMetadataBySocket.delete(client.socket);
+      this.cleanupIncomingStreamsForSocket(
+        client.socket,
+        `Client ${client.id} disconnected before stream transfer completed.`
+      );
 
       const decodedReason = decodeCloseReason(reason);
 
@@ -2338,6 +2877,268 @@ export class SecureServer {
           )
         );
       }
+    }
+  }
+
+  private getOrCreateIncomingServerStreams(
+    socket: WebSocket
+  ): Map<string, IncomingServerStreamState> {
+    const existingStreams = this.incomingStreamsBySocket.get(socket);
+
+    if (existingStreams) {
+      return existingStreams;
+    }
+
+    const streamMap = new Map<string, IncomingServerStreamState>();
+    this.incomingStreamsBySocket.set(socket, streamMap);
+    return streamMap;
+  }
+
+  private cleanupIncomingStreamsForSocket(socket: WebSocket, reason: string): void {
+    const streamMap = this.incomingStreamsBySocket.get(socket);
+
+    if (!streamMap) {
+      return;
+    }
+
+    for (const streamState of streamMap.values()) {
+      streamState.stream.destroy(new Error(reason));
+    }
+
+    streamMap.clear();
+    this.incomingStreamsBySocket.delete(socket);
+  }
+
+  private abortIncomingServerStream(
+    socket: WebSocket,
+    streamId: string,
+    reason: string
+  ): void {
+    const streamMap = this.incomingStreamsBySocket.get(socket);
+
+    if (!streamMap) {
+      return;
+    }
+
+    const streamState = streamMap.get(streamId);
+
+    if (!streamState) {
+      return;
+    }
+
+    streamState.stream.destroy(new Error(reason));
+    streamMap.delete(streamId);
+
+    if (streamMap.size === 0) {
+      this.incomingStreamsBySocket.delete(socket);
+    }
+  }
+
+  private dispatchServerStreamEvent(
+    event: string,
+    stream: Readable,
+    info: SecureIncomingStreamInfo,
+    client: SecureServerClient
+  ): void {
+    const handlers = this.streamEventHandlers.get(event);
+
+    if (!handlers || handlers.size === 0) {
+      stream.resume();
+      this.notifyError(
+        new Error(
+          `No stream handler is registered for event "${event}" on server client ${client.id}.`
+        )
+      );
+      return;
+    }
+
+    for (const handler of handlers) {
+      try {
+        const handlerResult = handler(stream, info, client);
+
+        if (isPromiseLike(handlerResult)) {
+          void Promise.resolve(handlerResult).catch((error) => {
+            this.notifyError(
+              normalizeToError(
+                error,
+                `Server stream handler failed for event ${event}.`
+              )
+            );
+          });
+        }
+      } catch (error) {
+        this.notifyError(
+          normalizeToError(
+            error,
+            `Server stream handler failed for event ${event}.`
+          )
+        );
+      }
+    }
+  }
+
+  private handleIncomingStreamStartFrame(
+    client: SecureServerClient,
+    framePayload: StreamFrameStartPayload
+  ): void {
+    if (isReservedEmitEvent(framePayload.event)) {
+      throw new Error(
+        `Reserved event "${framePayload.event}" cannot be used for stream transport.`
+      );
+    }
+
+    const incomingStreams = this.getOrCreateIncomingServerStreams(client.socket);
+
+    if (incomingStreams.has(framePayload.streamId)) {
+      throw new Error(
+        `Stream ${framePayload.streamId} already exists for client ${client.id}.`
+      );
+    }
+
+    const stream = new PassThrough();
+    const streamInfo: SecureIncomingStreamInfo = {
+      streamId: framePayload.streamId,
+      event: framePayload.event,
+      startedAt: Date.now(),
+      ...(framePayload.metadata !== undefined ? { metadata: framePayload.metadata } : {}),
+      ...(framePayload.totalBytes !== undefined ? { totalBytes: framePayload.totalBytes } : {})
+    };
+
+    incomingStreams.set(framePayload.streamId, {
+      info: streamInfo,
+      stream,
+      expectedChunkIndex: 0,
+      receivedBytes: 0
+    });
+
+    this.dispatchServerStreamEvent(framePayload.event, stream, streamInfo, client);
+  }
+
+  private handleIncomingStreamChunkFrame(
+    client: SecureServerClient,
+    framePayload: StreamFrameChunkPayload
+  ): void {
+    const incomingStreams = this.incomingStreamsBySocket.get(client.socket);
+    const streamState = incomingStreams?.get(framePayload.streamId);
+
+    if (!incomingStreams || !streamState) {
+      throw new Error(
+        `Stream ${framePayload.streamId} is unknown for client ${client.id}.`
+      );
+    }
+
+    if (framePayload.index !== streamState.expectedChunkIndex) {
+      throw new Error(
+        `Out-of-order chunk index for stream ${framePayload.streamId}. Expected ${streamState.expectedChunkIndex}, received ${framePayload.index}.`
+      );
+    }
+
+    const chunkBuffer = decodeBase64ToBuffer(
+      framePayload.payload,
+      `Stream chunk payload (${framePayload.streamId})`
+    );
+
+    if (chunkBuffer.length !== framePayload.byteLength) {
+      throw new Error(
+        `Stream ${framePayload.streamId} byteLength mismatch. Expected ${framePayload.byteLength}, received ${chunkBuffer.length}.`
+      );
+    }
+
+    streamState.expectedChunkIndex += 1;
+    streamState.receivedBytes += chunkBuffer.length;
+    streamState.stream.write(chunkBuffer);
+  }
+
+  private handleIncomingStreamEndFrame(
+    client: SecureServerClient,
+    framePayload: StreamFrameEndPayload
+  ): void {
+    const incomingStreams = this.incomingStreamsBySocket.get(client.socket);
+    const streamState = incomingStreams?.get(framePayload.streamId);
+
+    if (!incomingStreams || !streamState) {
+      throw new Error(
+        `Stream ${framePayload.streamId} is unknown for client ${client.id}.`
+      );
+    }
+
+    if (framePayload.chunkCount !== streamState.expectedChunkIndex) {
+      throw new Error(
+        `Stream ${framePayload.streamId} chunkCount mismatch. Expected ${streamState.expectedChunkIndex}, received ${framePayload.chunkCount}.`
+      );
+    }
+
+    if (framePayload.totalBytes !== streamState.receivedBytes) {
+      throw new Error(
+        `Stream ${framePayload.streamId} totalBytes mismatch. Expected ${streamState.receivedBytes}, received ${framePayload.totalBytes}.`
+      );
+    }
+
+    if (
+      streamState.info.totalBytes !== undefined &&
+      streamState.info.totalBytes !== streamState.receivedBytes
+    ) {
+      throw new Error(
+        `Stream ${framePayload.streamId} violated announced totalBytes (${streamState.info.totalBytes}).`
+      );
+    }
+
+    streamState.stream.end();
+    incomingStreams.delete(framePayload.streamId);
+
+    if (incomingStreams.size === 0) {
+      this.incomingStreamsBySocket.delete(client.socket);
+    }
+  }
+
+  private handleIncomingStreamAbortFrame(
+    client: SecureServerClient,
+    framePayload: StreamFrameAbortPayload
+  ): void {
+    this.abortIncomingServerStream(
+      client.socket,
+      framePayload.streamId,
+      framePayload.reason
+    );
+  }
+
+  private handleIncomingStreamFrame(client: SecureServerClient, data: unknown): void {
+    let framePayload: StreamFramePayload | null = null;
+
+    try {
+      framePayload = parseStreamFramePayload(data);
+
+      if (framePayload.type === "start") {
+        this.handleIncomingStreamStartFrame(client, framePayload);
+        return;
+      }
+
+      if (framePayload.type === "chunk") {
+        this.handleIncomingStreamChunkFrame(client, framePayload);
+        return;
+      }
+
+      if (framePayload.type === "end") {
+        this.handleIncomingStreamEndFrame(client, framePayload);
+        return;
+      }
+
+      this.handleIncomingStreamAbortFrame(client, framePayload);
+    } catch (error) {
+      const normalizedError = normalizeToError(
+        error,
+        `Failed to process incoming stream frame for client ${client.id}.`
+      );
+
+      if (framePayload) {
+        this.abortIncomingServerStream(
+          client.socket,
+          framePayload.streamId,
+          normalizedError.message
+        );
+      }
+
+      this.notifyError(normalizedError);
     }
   }
 
@@ -2910,6 +3711,13 @@ export class SecureServer {
 
         return this.emitTo(clientId, event, data, callbackOrOptions ?? {});
       },
+      emitStream: (
+        event: string,
+        source: SecureChunkedStreamSource,
+        options?: SecureChunkedStreamOptions
+      ): Promise<SecureStreamSendResult> => {
+        return this.emitStreamTo(clientId, event, source, options);
+      },
       join: (room: string): boolean => this.joinClientToRoom(clientId, room),
       leave: (room: string): boolean => this.leaveClientFromRoom(clientId, room),
       leaveAll: (): number => this.leaveClientFromAllRooms(clientId)
@@ -3112,6 +3920,8 @@ export class SecureClient {
 
   private readonly customEventHandlers = new Map<string, Set<SecureClientEventHandler>>();
 
+  private readonly streamEventHandlers = new Map<string, Set<SecureClientStreamHandler>>();
+
   private readonly connectHandlers = new Set<SecureClientConnectHandler>();
 
   private readonly disconnectHandlers = new Set<SecureClientDisconnectHandler>();
@@ -3125,6 +3935,8 @@ export class SecureClient {
   private pendingPayloadQueue: SecureEnvelope[] = [];
 
   private readonly pendingRpcRequests = new Map<string, PendingRpcRequest>();
+
+  private readonly incomingStreams = new Map<string, IncomingClientStreamState>();
 
   private sessionTicket: ClientSessionTicketRecord | null = null;
 
@@ -3297,6 +4109,46 @@ export class SecureClient {
     return this;
   }
 
+  public onStream(event: string, handler: SecureClientStreamHandler): this {
+    try {
+      if (isReservedEmitEvent(event)) {
+        throw new Error(`The event "${event}" is reserved and cannot be used as a stream event.`);
+      }
+
+      const listeners = this.streamEventHandlers.get(event) ?? new Set<SecureClientStreamHandler>();
+      listeners.add(handler);
+      this.streamEventHandlers.set(event, listeners);
+    } catch (error) {
+      this.notifyError(
+        normalizeToError(error, "Failed to register client stream handler.")
+      );
+    }
+
+    return this;
+  }
+
+  public offStream(event: string, handler: SecureClientStreamHandler): this {
+    try {
+      const listeners = this.streamEventHandlers.get(event);
+
+      if (!listeners) {
+        return this;
+      }
+
+      listeners.delete(handler);
+
+      if (listeners.size === 0) {
+        this.streamEventHandlers.delete(event);
+      }
+    } catch (error) {
+      this.notifyError(
+        normalizeToError(error, "Failed to remove client stream handler.")
+      );
+    }
+
+    return this;
+  }
+
   public emit(event: string, data: unknown): boolean;
   public emit(event: string, data: unknown, callback: SecureAckCallback): boolean;
   public emit(event: string, data: unknown, options: SecureAckOptions): Promise<unknown>;
@@ -3368,6 +4220,48 @@ export class SecureClient {
       }
 
       return false;
+    }
+  }
+
+  public async emitStream(
+    event: string,
+    source: SecureChunkedStreamSource,
+    options?: SecureChunkedStreamOptions
+  ): Promise<SecureStreamSendResult> {
+    try {
+      if (isReservedEmitEvent(event)) {
+        throw new Error(`The event "${event}" is reserved and cannot be emitted manually.`);
+      }
+
+      if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+        throw new Error("Client socket is not connected.");
+      }
+
+      if (!this.isHandshakeReady()) {
+        throw new Error(
+          `Cannot stream event "${event}" before secure handshake completion.`
+        );
+      }
+
+      return await transmitChunkedStreamFrames(
+        event,
+        source,
+        options,
+        async (framePayload) => {
+          await this.sendEncryptedEnvelope({
+            event: INTERNAL_STREAM_FRAME_EVENT,
+            data: framePayload
+          });
+        }
+      );
+    } catch (error) {
+      const normalizedError = normalizeToError(
+        error,
+        `Failed to emit chunked stream event "${event}".`
+      );
+
+      this.notifyError(normalizedError);
+      throw normalizedError;
     }
   }
 
@@ -3591,6 +4485,11 @@ export class SecureClient {
         return;
       }
 
+      if (decryptedEnvelope.event === INTERNAL_STREAM_FRAME_EVENT) {
+        this.handleIncomingStreamFrame(decryptedEnvelope.data);
+        return;
+      }
+
       if (decryptedEnvelope.event === INTERNAL_SESSION_TICKET_EVENT) {
         this.handleSessionTicket(decryptedEnvelope.data);
         return;
@@ -3607,6 +4506,9 @@ export class SecureClient {
       this.socket = null;
       this.handshakeState = null;
       this.pendingPayloadQueue = [];
+      this.cleanupIncomingStreams(
+        "Client disconnected before stream transfer completed."
+      );
       this.rejectPendingRpcRequests(
         new Error("Client disconnected before ACK response was received.")
       );
@@ -3658,6 +4560,193 @@ export class SecureClient {
           normalizeToError(error, `Client event handler failed for event ${event}.`)
         );
       }
+    }
+  }
+
+  private cleanupIncomingStreams(reason: string): void {
+    for (const streamState of this.incomingStreams.values()) {
+      streamState.stream.destroy(new Error(reason));
+    }
+
+    this.incomingStreams.clear();
+  }
+
+  private abortIncomingClientStream(streamId: string, reason: string): void {
+    const streamState = this.incomingStreams.get(streamId);
+
+    if (!streamState) {
+      return;
+    }
+
+    streamState.stream.destroy(new Error(reason));
+    this.incomingStreams.delete(streamId);
+  }
+
+  private dispatchClientStreamEvent(
+    event: string,
+    stream: Readable,
+    info: SecureIncomingStreamInfo
+  ): void {
+    const handlers = this.streamEventHandlers.get(event);
+
+    if (!handlers || handlers.size === 0) {
+      stream.resume();
+      this.notifyError(
+        new Error(`No stream handler is registered for event "${event}" on client.`)
+      );
+      return;
+    }
+
+    for (const handler of handlers) {
+      try {
+        const handlerResult = handler(stream, info);
+
+        if (isPromiseLike(handlerResult)) {
+          void Promise.resolve(handlerResult).catch((error) => {
+            this.notifyError(
+              normalizeToError(
+                error,
+                `Client stream handler failed for event ${event}.`
+              )
+            );
+          });
+        }
+      } catch (error) {
+        this.notifyError(
+          normalizeToError(error, `Client stream handler failed for event ${event}.`)
+        );
+      }
+    }
+  }
+
+  private handleIncomingClientStreamStartFrame(framePayload: StreamFrameStartPayload): void {
+    if (isReservedEmitEvent(framePayload.event)) {
+      throw new Error(
+        `Reserved event "${framePayload.event}" cannot be used for stream transport.`
+      );
+    }
+
+    if (this.incomingStreams.has(framePayload.streamId)) {
+      throw new Error(`Stream ${framePayload.streamId} already exists on client.`);
+    }
+
+    const stream = new PassThrough();
+    const streamInfo: SecureIncomingStreamInfo = {
+      streamId: framePayload.streamId,
+      event: framePayload.event,
+      startedAt: Date.now(),
+      ...(framePayload.metadata !== undefined ? { metadata: framePayload.metadata } : {}),
+      ...(framePayload.totalBytes !== undefined ? { totalBytes: framePayload.totalBytes } : {})
+    };
+
+    this.incomingStreams.set(framePayload.streamId, {
+      info: streamInfo,
+      stream,
+      expectedChunkIndex: 0,
+      receivedBytes: 0
+    });
+
+    this.dispatchClientStreamEvent(framePayload.event, stream, streamInfo);
+  }
+
+  private handleIncomingClientStreamChunkFrame(framePayload: StreamFrameChunkPayload): void {
+    const streamState = this.incomingStreams.get(framePayload.streamId);
+
+    if (!streamState) {
+      throw new Error(`Stream ${framePayload.streamId} is unknown on client.`);
+    }
+
+    if (framePayload.index !== streamState.expectedChunkIndex) {
+      throw new Error(
+        `Out-of-order chunk index for stream ${framePayload.streamId}. Expected ${streamState.expectedChunkIndex}, received ${framePayload.index}.`
+      );
+    }
+
+    const chunkBuffer = decodeBase64ToBuffer(
+      framePayload.payload,
+      `Stream chunk payload (${framePayload.streamId})`
+    );
+
+    if (chunkBuffer.length !== framePayload.byteLength) {
+      throw new Error(
+        `Stream ${framePayload.streamId} byteLength mismatch. Expected ${framePayload.byteLength}, received ${chunkBuffer.length}.`
+      );
+    }
+
+    streamState.expectedChunkIndex += 1;
+    streamState.receivedBytes += chunkBuffer.length;
+    streamState.stream.write(chunkBuffer);
+  }
+
+  private handleIncomingClientStreamEndFrame(framePayload: StreamFrameEndPayload): void {
+    const streamState = this.incomingStreams.get(framePayload.streamId);
+
+    if (!streamState) {
+      throw new Error(`Stream ${framePayload.streamId} is unknown on client.`);
+    }
+
+    if (framePayload.chunkCount !== streamState.expectedChunkIndex) {
+      throw new Error(
+        `Stream ${framePayload.streamId} chunkCount mismatch. Expected ${streamState.expectedChunkIndex}, received ${framePayload.chunkCount}.`
+      );
+    }
+
+    if (framePayload.totalBytes !== streamState.receivedBytes) {
+      throw new Error(
+        `Stream ${framePayload.streamId} totalBytes mismatch. Expected ${streamState.receivedBytes}, received ${framePayload.totalBytes}.`
+      );
+    }
+
+    if (
+      streamState.info.totalBytes !== undefined &&
+      streamState.info.totalBytes !== streamState.receivedBytes
+    ) {
+      throw new Error(
+        `Stream ${framePayload.streamId} violated announced totalBytes (${streamState.info.totalBytes}).`
+      );
+    }
+
+    streamState.stream.end();
+    this.incomingStreams.delete(framePayload.streamId);
+  }
+
+  private handleIncomingClientStreamAbortFrame(framePayload: StreamFrameAbortPayload): void {
+    this.abortIncomingClientStream(framePayload.streamId, framePayload.reason);
+  }
+
+  private handleIncomingStreamFrame(data: unknown): void {
+    let framePayload: StreamFramePayload | null = null;
+
+    try {
+      framePayload = parseStreamFramePayload(data);
+
+      if (framePayload.type === "start") {
+        this.handleIncomingClientStreamStartFrame(framePayload);
+        return;
+      }
+
+      if (framePayload.type === "chunk") {
+        this.handleIncomingClientStreamChunkFrame(framePayload);
+        return;
+      }
+
+      if (framePayload.type === "end") {
+        this.handleIncomingClientStreamEndFrame(framePayload);
+        return;
+      }
+
+      this.handleIncomingClientStreamAbortFrame(framePayload);
+    } catch (error) {
+      const normalizedError = normalizeToError(
+        error,
+        "Failed to process incoming stream frame on client."
+      );
+
+      if (framePayload) {
+        this.abortIncomingClientStream(framePayload.streamId, normalizedError.message);
+      }
+
+      this.notifyError(normalizedError);
     }
   }
 
